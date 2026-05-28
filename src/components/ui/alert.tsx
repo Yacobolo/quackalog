@@ -18,7 +18,7 @@ export type AlertProps = React.HTMLAttributes<HTMLDivElement> & {
 export function Alert({ className, variant = "info", ...props }: AlertProps): React.ReactElement {
   return (
     <div
-      className={cn("rounded-md border px-3 py-2 text-sm leading-5", variantClass[variant], className)}
+      className={cn("rounded-md border px-2.5 py-2 text-sm leading-5", variantClass[variant], className)}
       role={variant === "error" ? "alert" : "status"}
       {...props}
     />
