@@ -12,8 +12,15 @@ export type RemoteTable = {
 
 export type PreviewRow = Record<string, unknown>;
 
+export type PreviewColumn = {
+  name: string;
+  type: string;
+  nullable: boolean | null;
+};
+
 export type PreviewResult = {
   columns: string[];
+  columnMetadata: PreviewColumn[];
   rows: PreviewRow[];
 };
 
@@ -89,8 +96,11 @@ export class QuackClient {
       quoteIdentifier(table),
     ]);
 
+    const columnMetadata = columnMetadataFromTable(result);
+
     return {
-      columns: columnsFromTable(result),
+      columns: columnMetadata.map((column) => column.name),
+      columnMetadata,
       rows: rowsFromTable<PreviewRow>(result),
     };
   }
@@ -213,8 +223,14 @@ function rowsFromTable<T extends Record<string, unknown>>(table: { toArray(): un
   });
 }
 
-function columnsFromTable(table: { schema: { fields: Array<{ name: string }> } }): string[] {
-  return table.schema.fields.map((field) => field.name);
+function columnMetadataFromTable(table: {
+  schema: { fields: Array<{ name: string; type?: unknown; nullable?: unknown }> };
+}): PreviewColumn[] {
+  return table.schema.fields.map((field) => ({
+    name: field.name,
+    nullable: typeof field.nullable === "boolean" ? field.nullable : null,
+    type: field.type ? String(field.type) : "unknown",
+  }));
 }
 
 function getSuggestedQualifiedName(error: unknown): string | null {
