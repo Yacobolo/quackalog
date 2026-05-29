@@ -6,8 +6,10 @@ import { defineConfig, loadEnv } from "vite";
 export default defineConfig(({ mode }) => {
   const rawEnv = loadEnv(mode, process.cwd(), "");
   const isProduction = mode === "production";
+  const isGitHubPages = process.env.GITHUB_REPOSITORY?.toLowerCase() === "yacobolo/quackalog";
 
   return {
+    base: isProduction && isGitHubPages ? "/quackalog/" : "/",
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
