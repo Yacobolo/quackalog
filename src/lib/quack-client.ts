@@ -39,18 +39,11 @@ const MANUAL_BUNDLES: duckdb.DuckDBBundles = {
 
 export class QuackClient {
   private constructor(
-    private readonly db: duckdb.AsyncDuckDB,
     private readonly conn: duckdb.AsyncDuckDBConnection,
   ) {}
 
   static async create(uri: string, token: string): Promise<QuackClient> {
-    const bundle = await duckdb.selectBundle(MANUAL_BUNDLES);
-    const worker = new Worker(bundle.mainWorker!);
-    const logger = new duckdb.ConsoleLogger();
-    const db = new duckdb.AsyncDuckDB(logger, worker);
-
-    await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
-
+    const db = await warmDuckDB();
     const conn = await db.connect();
     const scope = normalizeScope(uri);
     const attachUri = attachUriFromScope(scope);
@@ -58,7 +51,7 @@ export class QuackClient {
     await loadQuackExtension(conn);
     await attachRemote(conn, scope, attachUri, token);
 
-    return new QuackClient(db, conn);
+    return new QuackClient(conn);
   }
 
   async listTables(): Promise<RemoteTable[]> {
@@ -107,7 +100,6 @@ export class QuackClient {
 
   async close(): Promise<void> {
     await this.conn.close();
-    await this.db.terminate();
   }
 
   private async previewRemoteCandidates(
@@ -151,6 +143,33 @@ export class QuackClient {
       FROM remote.query(${sqlString(remoteSql)});
     `);
   }
+}
+
+let duckDBPromise: Promise<duckdb.AsyncDuckDB> | null = null;
+
+export async function warmDuckDB(): Promise<duckdb.AsyncDuckDB> {
+  duckDBPromise ??= instantiateDuckDB();
+
+  return duckDBPromise;
+}
+
+async function instantiateDuckDB(): Promise<duckdb.AsyncDuckDB> {
+  const bundle = await duckdb.selectBundle(MANUAL_BUNDLES);
+  const worker = new Worker(bundle.mainWorker!);
+  const logger = new duckdb.ConsoleLogger();
+  const db = new duckdb.AsyncDuckDB(logger, worker);
+
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+
+  try {
+    const conn = await db.connect();
+    await loadQuackExtension(conn);
+    await conn.close();
+  } catch {
+    // A connection attempt will surface extension-loading failures with endpoint context.
+  }
+
+  return db;
 }
 
 export function tableKey(table: RemoteTable): string {
