@@ -14,8 +14,12 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-active: var(--primary-active);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary-hover: var(--secondary-hover);
+  --color-destructive-hover: var(--destructive-hover);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
   --color-accent: var(--accent);
@@ -33,6 +37,36 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-muted: var(--success-muted);
+  --color-success-foreground-muted: var(--success-foreground-muted);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-muted: var(--warning-muted);
+  --color-warning-foreground-muted: var(--warning-foreground-muted);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-info-muted: var(--info-muted);
+  --color-info-foreground-muted: var(--info-foreground-muted);
+  --color-done: var(--done);
+  --color-done-foreground: var(--done-foreground);
+  --color-done-muted: var(--done-muted);
+  --color-done-foreground-muted: var(--done-foreground-muted);
+  --color-danger: var(--danger);
+  --color-danger-muted: var(--danger-muted);
+  --color-danger-border: var(--danger-border);
+  --color-overlay-backdrop: var(--overlay-backdrop);
+  --color-disabled: var(--disabled);
+  --color-track: var(--track);
+  --color-track-checked: var(--track-checked);
+  --color-track-hover: var(--track-hover);
+  --color-knob-border: var(--knob-border);
+  --color-knob-checked: var(--knob-checked);
+  --color-sql-keyword: var(--sql-keyword);
+  --color-sql-string: var(--sql-string);
+  --color-sql-number: var(--sql-number);
+  --color-sql-comment: var(--sql-comment);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -49,8 +83,12 @@
   --popover-foreground: var(--fgColor-default);
   --primary: var(--button-primary-bgColor-rest);
   --primary-foreground: var(--button-primary-fgColor-rest);
+  --primary-hover: var(--button-primary-bgColor-hover);
+  --primary-active: var(--button-primary-bgColor-active);
   --secondary: var(--button-default-bgColor-rest);
   --secondary-foreground: var(--button-default-fgColor-rest);
+  --secondary-hover: var(--button-default-bgColor-hover);
+  --destructive-hover: var(--button-danger-bgColor-hover);
   --muted: var(--bgColor-muted);
   --muted-foreground: var(--fgColor-muted);
   --accent: var(--bgColor-accent-muted);
@@ -68,6 +106,36 @@
   --sidebar-accent-foreground: var(--fgColor-default);
   --sidebar-border: var(--borderColor-default);
   --sidebar-ring: var(--focus-outlineColor);
+  --success: var(--bgColor-success-emphasis);
+  --success-foreground: var(--fgColor-onEmphasis);
+  --success-muted: var(--bgColor-success-muted);
+  --success-foreground-muted: var(--fgColor-success);
+  --warning: var(--bgColor-attention-emphasis);
+  --warning-foreground: var(--fgColor-onEmphasis);
+  --warning-muted: var(--bgColor-attention-muted);
+  --warning-foreground-muted: var(--fgColor-attention);
+  --info: var(--bgColor-accent-emphasis);
+  --info-foreground: var(--fgColor-onEmphasis);
+  --info-muted: var(--bgColor-accent-muted);
+  --info-foreground-muted: var(--fgColor-accent);
+  --done: var(--bgColor-done-emphasis);
+  --done-foreground: var(--fgColor-onEmphasis);
+  --done-muted: var(--bgColor-done-muted);
+  --done-foreground-muted: var(--fgColor-done);
+  --danger: var(--fgColor-danger);
+  --danger-muted: var(--bgColor-danger-muted);
+  --danger-border: var(--borderColor-danger-emphasis);
+  --overlay-backdrop: var(--overlay-backdrop-bgColor);
+  --disabled: var(--bgColor-disabled);
+  --track: var(--controlTrack-bgColor-rest);
+  --track-checked: var(--control-checked-bgColor-rest);
+  --track-hover: var(--controlTrack-bgColor-hover);
+  --knob-border: var(--controlKnob-borderColor-rest);
+  --knob-checked: var(--controlKnob-bgColor-checked);
+  --sql-keyword: var(--codeMirror-syntax-fgColor-keyword);
+  --sql-string: var(--codeMirror-syntax-fgColor-string);
+  --sql-number: var(--codeMirror-syntax-fgColor-constant);
+  --sql-comment: var(--codeMirror-syntax-fgColor-comment);
   font-family:
     ui-sans-serif,
     -apple-system,
@@ -137,4 +205,22 @@ details > summary::-webkit-details-marker {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bgColor-neutral-muted);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--borderColor-emphasis);
 }

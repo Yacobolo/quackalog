@@ -5,10 +5,10 @@ import { cn } from "@/lib/utils";
 type AlertVariant = "info" | "success" | "warning" | "error";
 
 const variantClass: Record<AlertVariant, string> = {
-  info: "border-border bg-card text-card-foreground",
-  success: "border-primary/20 bg-primary/10 text-foreground",
-  warning: "border-border bg-muted text-foreground",
-  error: "border-destructive/50 bg-card text-destructive",
+  info: "border-info-muted/40 bg-info-muted text-info-foreground-muted",
+  success: "border-success-muted/40 bg-success-muted text-success-foreground-muted",
+  warning: "border-warning-muted/40 bg-warning-muted text-warning-foreground-muted",
+  error: "border-danger-muted/40 bg-danger-muted text-danger",
 };
 
 export type AlertProps = React.HTMLAttributes<HTMLDivElement> & {

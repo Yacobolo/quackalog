@@ -60,7 +60,7 @@ import {
   saveEncryptedToken,
   unlockEncryptedToken,
 } from "@/lib/token-vault";
-import { cn } from "@/lib/utils";
+import { cn, highlightSql } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "ready" | "error";
 type DuckDBState = "idle" | "warming" | "ready" | "error";
@@ -104,6 +104,7 @@ export function App(): React.ReactElement {
   const clientRef = useRef<QuackClient | null>(null);
   const previewRunRef = useRef(0);
   const lockTimerRef = useRef<number | null>(null);
+  const autoConnectRef = useRef(false);
   const [connections, setConnections] = useState<ConnectionProfile[]>(() => readStoredConnections());
   const [activeConnectionId, setActiveConnectionId] = useState(() => readStoredActiveConnectionId());
   const [isCreatingConnection, setIsCreatingConnection] = useState(false);
@@ -208,6 +209,7 @@ export function App(): React.ReactElement {
       void warmDuckDB()
         .then(() => {
           setDuckDBState("ready");
+          tryAutoConnect();
         })
         .catch((error: unknown) => {
           setDuckDBState("error");
@@ -221,6 +223,41 @@ export function App(): React.ReactElement {
       void clientRef.current?.close();
     };
   }, []);
+
+  function tryAutoConnect(): void {
+    if (autoConnectRef.current) {
+      return;
+    }
+
+    autoConnectRef.current = true;
+
+    const savedConnectionId = readStoredActiveConnectionId();
+    const savedConnections = readStoredConnections();
+    const profile = savedConnections.find((c) => c.id === savedConnectionId);
+
+    if (!profile || !DEV_TOKEN || hasTokenVaultRecord(profile.id)) {
+      return;
+    }
+
+    setConnectionState("connecting");
+    setMessage({ kind: "info", text: `Connecting to ${profile.name}.` });
+
+    QuackClient.create(profile.endpoint, DEV_TOKEN)
+      .then((client) => {
+        clientRef.current = client;
+        return client.listTables();
+      })
+      .then((remoteTables) => {
+        setConnectionState("ready");
+        setTables(remoteTables);
+        setMessage({ kind: "success", text: `Connected to ${profile.name}.` });
+      })
+      .catch((error: unknown) => {
+        clientRef.current = null;
+        setConnectionState("idle");
+        setMessage({ kind: "error", text: formatError(error) });
+      });
+  }
 
   const visibleTables = useMemo(() => {
     const query = catalogSearch.trim().toLowerCase();
@@ -252,8 +289,75 @@ export function App(): React.ReactElement {
       return;
     }
 
-    setMessage({ kind: "success", text: `Saved ${profile.name}.` });
-    setIsConnectionDialogOpen(false);
+    const connected = await establishConnection(profile);
+
+    if (connected) {
+      setIsConnectionDialogOpen(false);
+    }
+  }
+
+  async function establishConnection(profile: ConnectionProfile): Promise<boolean> {
+    clearLockTimer();
+    previewRunRef.current += 1;
+    void clientRef.current?.close();
+    clientRef.current = null;
+    setConnectionState("connecting");
+    setTables([]);
+    setSelectedSchema("");
+    setSelectedTableKey("");
+    setActiveTab("preview");
+    setPreview({ isLoading: false, table: null, result: null });
+
+    let secret: string;
+
+    if (connectionMode === "unlock") {
+      const secretPassphrase = vaultSecret || passphrase;
+
+      if (!secretPassphrase) {
+        setConnectionState("idle");
+        setMessage({ kind: "info", text: `Saved ${profile.name}. Enter your passphrase to connect.` });
+        return false;
+      }
+
+      try {
+        secret = await unlockEncryptedToken(secretPassphrase, profile.id);
+        setVaultSecret(secretPassphrase);
+        setVaultState("unlocked");
+        startLockTimer();
+      } catch (error) {
+        setConnectionState("error");
+        setMessage({ kind: "error", text: formatError(error) });
+        return false;
+      }
+    } else {
+      secret = token.trim() || DEV_TOKEN;
+
+      if (!secret) {
+        setConnectionState("idle");
+        setMessage({ kind: "error", text: "Enter a token before saving." });
+        return false;
+      }
+    }
+
+    try {
+      const client = await QuackClient.create(profile.endpoint, secret);
+      clientRef.current = client;
+      const remoteTables = await client.listTables();
+      setConnectionState("ready");
+      setTables(remoteTables);
+      setMessage({
+        kind: "success",
+        text: `Connected to ${profile.name}. Found ${remoteTables.length} ${remoteTables.length === 1 ? "table" : "tables"}.`,
+      });
+      setPassphrase("");
+      setToken("");
+      return true;
+    } catch (error) {
+      clientRef.current = null;
+      setConnectionState("error");
+      setMessage({ kind: "error", text: formatError(error) });
+      return false;
+    }
   }
 
   async function handleCheckConnection(): Promise<void> {
@@ -908,7 +1012,7 @@ function ConnectionDialog({
                 <span>{warningText}</span>
               </Alert>
 
-              {message.kind === "error" || connectionState === "connecting" ? (
+              {message.text ? (
                 <Alert variant={message.kind}>{message.text}</Alert>
               ) : null}
             </div>
@@ -1044,9 +1148,9 @@ function CatalogSidebar({
         <span
           className={cn(
             "grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground",
-            status.badgeVariant === "success" && "text-primary",
-            status.badgeVariant === "warning" && "text-warning-foreground",
-            status.badgeVariant === "destructive" && "text-destructive",
+            status.badgeVariant === "success" && "text-success-foreground-muted",
+            status.badgeVariant === "warning" && "text-warning-foreground-muted",
+            status.badgeVariant === "destructive" && "text-danger",
           )}
           title={status.label}
         >
@@ -1147,8 +1251,13 @@ function ConnectionTree({
                 {connection.name || formatEndpoint(connection.endpoint)}
               </span>
               {isActive ? (
-                <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[0.68rem] font-bold leading-none text-muted-foreground">
-                  {isConnected ? "active" : "locked"}
+                <span
+                  className={cn(
+                    "rounded-sm px-1.5 py-0.5 text-[0.68rem] font-bold leading-none",
+                    isConnected ? "bg-success-muted text-success-foreground-muted" : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  {isConnected ? "active" : "offline"}
                 </span>
               ) : null}
             </summary>
@@ -1560,8 +1669,8 @@ function QueryPanel({ selectedTable }: { selectedTable: RemoteTable | null }): R
 
   return (
     <div className="h-full overflow-auto">
-      <pre className="overflow-auto p-3 text-sm leading-6">
-        <code>{query}</code>
+      <pre className="overflow-auto p-3 text-sm leading-6 font-mono">
+        <code>{highlightSql(query)}</code>
       </pre>
     </div>
   );

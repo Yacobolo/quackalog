@@ -18,7 +18,7 @@ export function TableBody({ className, ...props }: React.HTMLAttributes<HTMLTabl
 }
 
 export function TableRow({ className, ...props }: React.HTMLAttributes<HTMLTableRowElement>): React.ReactElement {
-  return <tr className={cn("border-b border-border transition-colors hover:bg-muted/45", className)} {...props} />;
+  return <tr className={cn("border-b border-border transition-colors hover:bg-muted", className)} {...props} />;
 }
 
 export function TableHead({ className, ...props }: React.ThHTMLAttributes<HTMLTableCellElement>): React.ReactElement {

@@ -49,7 +49,7 @@ export function DialogContent({
   onOpenChange,
 }: DialogContentProps): React.ReactElement {
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-background/70 p-4 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 grid place-items-center bg-overlay-backdrop p-4 backdrop-blur-sm">
       <button
         aria-label="Close connection dialog"
         className="absolute inset-0 cursor-default"
