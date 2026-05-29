@@ -24,6 +24,49 @@ export type PreviewResult = {
   rows: PreviewRow[];
 };
 
+export type TableStorage = {
+  estimated_size: number;
+  column_count: number;
+  row_count: number;
+  has_primary_key: boolean;
+};
+
+export type ColumnStat = {
+  column_name: string;
+  column_type: string;
+  min: string | null;
+  max: string | null;
+  approx_unique: number | null;
+  avg: number | null;
+  std: number | null;
+  q25: string | null;
+  q50: string | null;
+  q75: string | null;
+  count: number;
+  null_percentage: number;
+  contains_null?: boolean;
+};
+
+export type ColumnDetail = {
+  column_name: string;
+  ordinal_position: number;
+  column_default: string | null;
+  is_nullable: string;
+  data_type: string;
+  character_maximum_length: number | null;
+};
+
+export type TableDDL = {
+  sql: string;
+};
+
+export type SnapshotRow = {
+  snapshot_id: number;
+  snapshot_time: string;
+  author: string | null;
+  commit_message: string | null;
+};
+
 export const PREVIEW_LIMIT = 100;
 
 const MANUAL_BUNDLES: duckdb.DuckDBBundles = {
@@ -100,6 +143,138 @@ export class QuackClient {
 
   async close(): Promise<void> {
     await this.conn.close();
+  }
+
+  async getTableDDL(schema: string, table: string): Promise<TableDDL> {
+    const [row] = await this.queryRemoteRows<TableDDL>(`
+      SELECT sql
+      FROM duckdb_tables()
+      WHERE schema_name = ${sqlString(schema)}
+        AND table_name = ${sqlString(table)}
+        AND NOT internal
+    `);
+
+    return row ?? { sql: "" };
+  }
+
+  async getTableStats(schema: string, table: string): Promise<ColumnStat[]> {
+    const metaDb = await this.getDucklakeMetaDb();
+    const remoteSql = `
+      SELECT
+        c.column_name,
+        c.data_type AS column_type,
+        CAST(cs.min_value AS VARCHAR) AS min,
+        CAST(cs.max_value AS VARCHAR) AS max,
+        NULL AS approx_unique,
+        NULL AS avg,
+        NULL AS std,
+        NULL AS q25,
+        NULL AS q50,
+        NULL AS q75,
+        0 AS count,
+        0 AS null_percentage,
+        cs.contains_null
+      FROM ${metaDb}.public.ducklake_table t
+      JOIN ${metaDb}.public.ducklake_schema s ON t.schema_id = s.schema_id
+      JOIN information_schema."columns" c ON c.table_schema = s.schema_name AND c.table_name = t.table_name
+      JOIN ${metaDb}.public.ducklake_table_column_stats cs ON t.table_id = cs.table_id AND cs.column_id = c.ordinal_position
+      WHERE t.end_snapshot IS NULL
+        AND s.schema_name = ${sqlString(schema)}
+        AND t.table_name = ${sqlString(table)}
+      ORDER BY c.ordinal_position
+    `;
+
+    return this.queryRemoteRows<ColumnStat>(remoteSql);
+  }
+
+  async getColumnDetails(schema: string, table: string): Promise<ColumnDetail[]> {
+    return this.queryRemoteRows<ColumnDetail>(`
+      SELECT
+        column_name,
+        ordinal_position,
+        column_default,
+        is_nullable,
+        data_type,
+        character_maximum_length
+      FROM information_schema."columns"
+      WHERE table_schema = ${sqlString(schema)}
+        AND table_name = ${sqlString(table)}
+      ORDER BY ordinal_position
+    `);
+  }
+
+  async getTableStorage(schema: string, table: string): Promise<TableStorage> {
+    const [ddRow] = await this.queryRemoteRows<Pick<TableStorage, "estimated_size" | "column_count" | "has_primary_key">>(`
+      SELECT
+        COALESCE(estimated_size, 0) AS estimated_size,
+        column_count,
+        COALESCE(has_primary_key, false) AS has_primary_key
+      FROM duckdb_tables()
+      WHERE schema_name = ${sqlString(schema)}
+        AND table_name = ${sqlString(table)}
+        AND NOT internal
+    `);
+
+    const metaDb = await this.getDucklakeMetaDb();
+    const [dlRow] = await this.queryRemoteRows<Pick<TableStorage, "row_count" | "estimated_size">>(`
+      SELECT
+        COALESCE(st.record_count, 0) AS row_count,
+        COALESCE(st.file_size_bytes, 0) AS estimated_size
+      FROM ${metaDb}.public.ducklake_table t
+      JOIN ${metaDb}.public.ducklake_schema s ON t.schema_id = s.schema_id
+      LEFT JOIN ${metaDb}.public.ducklake_table_stats st ON t.table_id = st.table_id
+      WHERE t.end_snapshot IS NULL
+        AND s.schema_name = ${sqlString(schema)}
+        AND t.table_name = ${sqlString(table)}
+    `);
+
+    return {
+      estimated_size: Number(dlRow?.estimated_size ?? ddRow?.estimated_size ?? 0),
+      column_count: Number(ddRow?.column_count ?? 0),
+      row_count: Number(dlRow?.row_count ?? 0),
+      has_primary_key: ddRow?.has_primary_key ?? false,
+    };
+  }
+
+  async getSnapshotHistory(schema: string, table: string): Promise<SnapshotRow[]> {
+    const metaDb = await this.getDucklakeMetaDb();
+
+    return this.queryRemoteRows<SnapshotRow>(`
+      SELECT DISTINCT s.snapshot_id, s.snapshot_time, sc.author, sc.commit_message
+      FROM ${metaDb}.public.ducklake_table t
+      JOIN ${metaDb}.public.ducklake_schema sch ON t.schema_id = sch.schema_id
+      CROSS JOIN ${metaDb}.public.ducklake_snapshot s
+      LEFT JOIN ${metaDb}.public.ducklake_snapshot_changes sc ON s.snapshot_id = sc.snapshot_id
+      WHERE t.end_snapshot IS NULL
+        AND sch.schema_name = ${sqlString(schema)}
+        AND t.table_name = ${sqlString(table)}
+        AND s.snapshot_id >= COALESCE(t.begin_snapshot, 0)
+      ORDER BY s.snapshot_id DESC
+    `);
+  }
+
+  private ducklakeMetaDb: string | null = null;
+
+  private async getDucklakeMetaDb(): Promise<string> {
+    if (this.ducklakeMetaDb) return this.ducklakeMetaDb;
+
+    const rows = await this.queryRemoteRows<{ database_name: string }>(`
+      SELECT DISTINCT database_name
+      FROM duckdb_tables()
+      WHERE database_name LIKE '__ducklake_metadata_%'
+    `);
+
+    this.ducklakeMetaDb = rows[0]?.database_name ?? "__ducklake_metadata_unknown";
+    return this.ducklakeMetaDb;
+  }
+
+  private async queryRemoteRows<T extends Record<string, unknown>>(remoteSql: string): Promise<T[]> {
+    const result = await this.conn.query(`
+      SELECT *
+      FROM remote.query(${sqlString(remoteSql)});
+    `);
+
+    return rowsFromTable<T>(result);
   }
 
   private async previewRemoteCandidates(

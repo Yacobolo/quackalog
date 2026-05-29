@@ -12,13 +12,14 @@ import {
   CheckCircle2,
   ChevronRight,
   Database,
-  FileCode2,
-  Info,
+  History,
   KeyRound,
   LockKeyhole,
   Loader2,
   Monitor,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   Rows3,
   Search,
@@ -46,6 +47,10 @@ import {
   PREVIEW_LIMIT,
   type PreviewResult,
   type PreviewRow,
+  type ColumnStat,
+  type ColumnDetail,
+  type TableStorage,
+  type SnapshotRow,
   QuackClient,
   type RemoteTable,
   stringifyCell,
@@ -60,7 +65,7 @@ import {
   saveEncryptedToken,
   unlockEncryptedToken,
 } from "@/lib/token-vault";
-import { cn, highlightSql } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 
 type ConnectionState = "idle" | "connecting" | "ready" | "error";
 type DuckDBState = "idle" | "warming" | "ready" | "error";
@@ -68,7 +73,7 @@ type TokenVaultState = "absent" | "memory" | "locked" | "unlocked";
 type ConnectionMode = "paste" | "unlock";
 type MessageKind = "info" | "success" | "warning" | "error";
 type ThemeMode = "light" | "dark" | "system";
-type WorkspaceTab = "preview" | "metadata" | "query";
+type WorkspaceTab = "preview" | "columns" | "history";
 
 type PreviewState = {
   isLoading: boolean;
@@ -93,11 +98,16 @@ const ENDPOINT_KEY = "quackalog.endpoint";
 const CONNECTIONS_KEY = "quackalog.connections";
 const ACTIVE_CONNECTION_KEY = "quackalog.active-connection";
 const THEME_KEY = "quackalog.theme";
+const SIDEBAR_COLLAPSED_KEY = "quackalog.sidebar-collapsed";
+const SIDEBAR_WIDTH_KEY = "quackalog.sidebar-width";
+const SIDEBAR_MIN_WIDTH = 200;
+const SIDEBAR_MAX_WIDTH = 500;
+const SIDEBAR_DEFAULT_WIDTH = 300;
 const TOKEN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string; Icon: typeof Table2 }> = [
   { id: "preview", label: "Preview", Icon: Rows3 },
-  { id: "metadata", label: "Metadata", Icon: Info },
-  { id: "query", label: "Query", Icon: FileCode2 },
+  { id: "columns", label: "Columns", Icon: Table2 },
+  { id: "history", label: "History", Icon: History },
 ];
 
 export function App(): React.ReactElement {
@@ -107,6 +117,14 @@ export function App(): React.ReactElement {
   const autoConnectRef = useRef(false);
   const [connections, setConnections] = useState<ConnectionProfile[]>(() => readStoredConnections());
   const [activeConnectionId, setActiveConnectionId] = useState(() => readStoredActiveConnectionId());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readStoredString(SIDEBAR_COLLAPSED_KEY, "true") === "true");
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const stored = Number(readStoredString(SIDEBAR_WIDTH_KEY, String(SIDEBAR_DEFAULT_WIDTH)));
+    return Number.isFinite(stored) && stored >= SIDEBAR_MIN_WIDTH && stored <= SIDEBAR_MAX_WIDTH ? stored : SIDEBAR_DEFAULT_WIDTH;
+  });
+  const [isResizing, setIsResizing] = useState(false);
+  const sidebarWidthRef = useRef(sidebarWidth);
+  sidebarWidthRef.current = sidebarWidth;
   const [isCreatingConnection, setIsCreatingConnection] = useState(false);
   const [connectionName, setConnectionName] = useState("");
   const [endpoint, setEndpoint] = useState("");
@@ -139,6 +157,11 @@ export function App(): React.ReactElement {
     table: null,
     result: null,
   });
+  const [ducklakeStats, setDucklakeStats] = useState<ColumnStat[]>([]);
+  const [ducklakeStorage, setDucklakeStorage] = useState<TableStorage | null>(null);
+  const [ducklakeColumns, setDucklakeColumns] = useState<ColumnDetail[]>([]);
+  const [ducklakeMetaLoading, setDucklakeMetaLoading] = useState(false);
+  const [ducklakeSnapshots, setDucklakeSnapshots] = useState<SnapshotRow[]>([]);
   const vaultSupported = isTokenVaultSupported();
 
   useEffect(() => {
@@ -223,6 +246,33 @@ export function App(): React.ReactElement {
       void clientRef.current?.close();
     };
   }, []);
+
+
+  useEffect(() => {
+    if (!isResizing) {
+      return;
+    }
+
+    const onMouseMove = (event: MouseEvent): void => {
+      setSidebarWidth(Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, event.clientX)));
+    };
+
+    const onMouseUp = (): void => {
+      setIsResizing(false);
+      writeStoredString(SIDEBAR_WIDTH_KEY, String(sidebarWidthRef.current));
+      document.body.classList.remove("select-none", "cursor-col-resize");
+    };
+
+    document.body.classList.add("select-none", "cursor-col-resize");
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+
+    return () => {
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+      document.body.classList.remove("select-none", "cursor-col-resize");
+    };
+  }, [isResizing]);
 
   function tryAutoConnect(): void {
     if (autoConnectRef.current) {
@@ -498,6 +548,14 @@ export function App(): React.ReactElement {
     setMessage({ kind: "success", text: `Deleted ${connection.name}.` });
   }
 
+  function handleToggleSidebar(): void {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      writeStoredString(SIDEBAR_COLLAPSED_KEY, String(next));
+      return next;
+    });
+  }
+
   function closeActiveClientForSwitch(): void {
     clearLockTimer();
     previewRunRef.current += 1;
@@ -653,10 +711,15 @@ export function App(): React.ReactElement {
   async function previewTableWithClient(client: QuackClient, table: RemoteTable): Promise<void> {
     const runId = previewRunRef.current + 1;
     previewRunRef.current = runId;
+    const isDucklake = table.table_type !== "INTERNAL";
     setSelectedSchema("");
     setSelectedTableKey(tableKey(table));
     setActiveTab("preview");
     setPreview({ isLoading: true, table, result: null });
+    setDucklakeStats([]);
+    setDucklakeStorage(null);
+    setDucklakeColumns([]);
+    setDucklakeSnapshots([]);
     setMessage({ kind: "info", text: `Loading ${table.table_schema}.${table.table_name}.` });
 
     try {
@@ -678,12 +741,44 @@ export function App(): React.ReactElement {
 
       setPreview({ isLoading: false, table, result: null });
       setMessage({ kind: "error", text: formatError(error) });
+      return;
     }
+
+    if (!isDucklake) {
+      return;
+    }
+
+    setDucklakeMetaLoading(true);
+
+    const results = await Promise.allSettled([
+      client.getTableStats(table.table_schema, table.table_name),
+      client.getTableStorage(table.table_schema, table.table_name),
+      client.getColumnDetails(table.table_schema, table.table_name),
+      client.getSnapshotHistory(table.table_schema, table.table_name),
+    ]);
+
+    if (previewRunRef.current !== runId) {
+      return;
+    }
+
+    const [statsResult, storageResult, columnsResult, snapshotsResult] = results;
+
+    if (statsResult.status === "fulfilled") setDucklakeStats(statsResult.value);
+    if (storageResult.status === "fulfilled") setDucklakeStorage(storageResult.value);
+    if (columnsResult.status === "fulfilled") setDucklakeColumns(columnsResult.value);
+    if (snapshotsResult.status === "fulfilled") setDucklakeSnapshots(snapshotsResult.value);
+
+    setDucklakeMetaLoading(false);
   }
 
   return (
     <main className="h-dvh overflow-hidden bg-background text-foreground">
-      <div className="grid h-full min-h-0 grid-cols-[300px_minmax(0,1fr)] overflow-hidden">
+      <div
+        className="grid h-full min-h-0 overflow-hidden"
+        style={{
+          gridTemplateColumns: sidebarCollapsed ? "48px minmax(0,1fr)" : `${sidebarWidth}px 6px minmax(0,1fr)`,
+        }}
+      >
         <ConnectionDialog
           connectionMode={connectionMode}
           connectionState={connectionState}
@@ -714,6 +809,7 @@ export function App(): React.ReactElement {
         />
 
         <CatalogSidebar
+          collapsed={sidebarCollapsed}
           connectionState={connectionState}
           connections={connections}
           activeConnectionId={activeConnectionId}
@@ -735,7 +831,17 @@ export function App(): React.ReactElement {
           onSearchChange={setCatalogSearch}
           onSelectSchema={handleSelectSchema}
           onThemeChange={() => setTheme(getNextTheme(theme))}
+          onToggleSidebar={handleToggleSidebar}
         />
+
+        {!sidebarCollapsed ? (
+          <div
+            className="group/handle relative z-10 w-full cursor-col-resize"
+            onMouseDown={() => setIsResizing(true)}
+          >
+            <div className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border transition-colors group-hover/handle:bg-primary/40" />
+          </div>
+        ) : null}
 
         <PreviewWorkspace
           activeTab={activeTab}
@@ -745,6 +851,11 @@ export function App(): React.ReactElement {
           schemaTables={selectedSchemaTables}
           selectedSchema={selectedSchema}
           selectedTable={selectedTable}
+          ducklakeStats={ducklakeStats}
+          ducklakeStorage={ducklakeStorage}
+          ducklakeColumns={ducklakeColumns}
+          ducklakeMetaLoading={ducklakeMetaLoading}
+          ducklakeSnapshots={ducklakeSnapshots}
           onActiveTabChange={setActiveTab}
           onPreviewTable={handlePreviewTable}
           onSelectCatalog={handleSelectCatalog}
@@ -1038,6 +1149,7 @@ function ConnectionDialog({
 
 type CatalogSidebarProps = {
   activeConnectionId: string;
+  collapsed: boolean;
   connectionState: ConnectionState;
   connections: ConnectionProfile[];
   filteredCount: number;
@@ -1058,10 +1170,12 @@ type CatalogSidebarProps = {
   onSelectSchema: (schema: string) => void;
   onSelectConnection: (connection: ConnectionProfile) => void;
   onThemeChange: () => void;
+  onToggleSidebar: () => void;
 };
 
 function CatalogSidebar({
   activeConnectionId,
+  collapsed,
   connectionState,
   connections,
   filteredCount,
@@ -1082,23 +1196,82 @@ function CatalogSidebar({
   onSelectSchema,
   onSelectConnection,
   onThemeChange,
+  onToggleSidebar,
 }: CatalogSidebarProps): React.ReactElement {
   const vaultMeta = getVaultMeta(vaultState);
   const activeConnection = connections.find((connection) => connection.id === activeConnectionId) ?? null;
 
+  if (collapsed) {
+    return (
+      <aside className="flex min-h-0 flex-col items-center gap-2 overflow-hidden border-r border-border bg-sidebar text-sidebar-foreground py-2">
+        <Button aria-label="Expand sidebar" size="icon" title="Expand sidebar" type="button" variant="quiet" onClick={onToggleSidebar}>
+          <PanelLeftOpen className="size-4" />
+        </Button>
+
+        <div className="border-b border-sidebar-border w-6" />
+
+        <div className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-card text-primary">
+          <Database className="size-4" />
+        </div>
+
+        <Button aria-label="Add catalog" size="icon" title="Add catalog" type="button" variant="quiet" onClick={onAddConnection}>
+          <Plus className="size-4" />
+        </Button>
+
+        <div className="flex-1" />
+
+        <Button
+          aria-label="Catalog connections"
+          disabled={connectionState === "connecting"}
+          size="icon"
+          title={activeConnection ? `${activeConnection.name} · ${vaultMeta.label}` : "Catalog connections"}
+          type="button"
+          variant="quiet"
+          onClick={onConnectionOpen}
+        >
+          <Settings2 className="size-4" />
+        </Button>
+
+        <span
+          className={cn(
+            "grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground",
+            status.badgeVariant === "success" && "text-success-foreground-muted",
+            status.badgeVariant === "warning" && "text-warning-foreground-muted",
+            status.badgeVariant === "destructive" && "text-danger",
+          )}
+          title={status.label}
+        >
+          <status.Icon className={cn("size-3.5", connectionState === "connecting" && "animate-spin")} />
+        </span>
+
+        <Button
+          aria-label={`Theme: ${themeMeta.label}`}
+          size="icon"
+          title={`Theme: ${themeMeta.label}`}
+          type="button"
+          variant="quiet"
+          onClick={onThemeChange}
+        >
+          <themeMeta.Icon className="size-4" />
+        </Button>
+      </aside>
+    );
+  }
+
   return (
     <aside className="flex min-h-0 flex-col overflow-hidden border-r border-border bg-sidebar text-sidebar-foreground">
-      <div className="border-b border-sidebar-border p-3">
-        <div className="flex items-center gap-2">
-          <div className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-card text-primary">
-            <Database className="size-4.5" />
-          </div>
-          <h1 className="min-w-0 flex-1 truncate text-base font-black leading-5">quackalog</h1>
-          <Badge variant="outline">{filteredCount}/{tableCount}</Badge>
-          <Button aria-label="Add catalog" size="icon" title="Add catalog" type="button" variant="quiet" onClick={onAddConnection}>
-            <Plus />
-          </Button>
+      <div className="flex items-center gap-2 border-b border-sidebar-border p-3">
+        <div className="grid size-8 shrink-0 place-items-center rounded-md border border-border bg-card text-primary">
+          <Database className="size-4.5" />
         </div>
+        <h1 className="min-w-0 flex-1 truncate text-base font-black leading-5">quackalog</h1>
+        <Badge variant="outline">{filteredCount}/{tableCount}</Badge>
+        <Button aria-label="Add catalog" size="icon" title="Add catalog" type="button" variant="quiet" onClick={onAddConnection}>
+          <Plus />
+        </Button>
+        <Button aria-label="Collapse sidebar" size="icon" title="Collapse sidebar" type="button" variant="quiet" onClick={onToggleSidebar}>
+          <PanelLeftClose className="size-4" />
+        </Button>
       </div>
 
       <div className="grid gap-2 border-b border-sidebar-border p-2.5">
@@ -1273,7 +1446,7 @@ function ConnectionTree({
                     const isSchemaSelected = selectedSchema === schema;
 
                     return (
-                      <details className="group/schema" key={schema} open>
+                      <details className="group/schema" key={schema}>
                         <summary
                           className={cn(
                             "grid h-7 cursor-pointer list-none grid-cols-[14px_18px_minmax(0,1fr)_auto] items-center gap-2 rounded-md px-2 text-sm font-bold outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring",
@@ -1305,15 +1478,19 @@ function ConnectionTree({
                             return (
                               <button
                                 className={cn(
-                                  "grid h-7 grid-cols-[18px_minmax(0,1fr)] items-center gap-2 rounded-md px-2 text-left text-sm transition-colors hover:bg-muted",
-                                  isSelected && "bg-primary text-primary-foreground hover:bg-primary",
+                                  "grid h-7 grid-cols-[18px_minmax(0,1fr)] items-center gap-2 rounded-md px-2 text-left text-sm transition-colors hover:bg-muted border-l-2 border-l-transparent",
+                                  isSelected && "bg-sidebar-accent text-sidebar-accent-foreground border-l-primary",
                                 )}
                                 key={key}
                                 type="button"
                                 onClick={() => void onPreviewTable(table)}
                               >
-                                <Table2 className="size-3.5 shrink-0 opacity-70" />
-                                <span className="truncate font-semibold">{table.table_name}</span>
+                                {table.table_type !== "INTERNAL" && !table.table_name.startsWith("ducklake_") ? (
+                                  <WaveIcon className="size-3.5 shrink-0 text-info-foreground-muted" />
+                                ) : (
+                                  <Table2 className="size-3.5 shrink-0 opacity-70" />
+                                )}
+                                <span className="truncate">{table.table_name}</span>
                               </button>
                             );
                           })}
@@ -1359,6 +1536,11 @@ type PreviewWorkspaceProps = {
   schemaTables: RemoteTable[];
   selectedSchema: string;
   selectedTable: RemoteTable | null;
+  ducklakeStats: ColumnStat[];
+  ducklakeStorage: TableStorage | null;
+  ducklakeColumns: ColumnDetail[];
+  ducklakeMetaLoading: boolean;
+  ducklakeSnapshots: SnapshotRow[];
   onActiveTabChange: (tab: WorkspaceTab) => void;
   onPreviewTable: (table: RemoteTable) => Promise<void>;
   onSelectCatalog: () => void;
@@ -1373,6 +1555,11 @@ function PreviewWorkspace({
   schemaTables,
   selectedSchema,
   selectedTable,
+  ducklakeStats,
+  ducklakeStorage,
+  ducklakeColumns,
+  ducklakeMetaLoading,
+  ducklakeSnapshots,
   onActiveTabChange,
   onPreviewTable,
   onSelectCatalog,
@@ -1383,14 +1570,16 @@ function PreviewWorkspace({
   const selectedTableType = selectedTable ? getDisplayTableType(selectedTable) : "";
   const isSchemaView = selectedSchema.length > 0;
   const isCatalogView = Boolean(activeConnection && !selectedSchema && !selectedTable);
+  const isDucklake = selectedTable ? selectedTable.table_type !== "INTERNAL" : false;
+  const visibleTabs = WORKSPACE_TABS.filter((tab) => tab.id === "history" ? isDucklake : true);
 
   return (
     <section className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-background">
-      <div className="border-b border-border bg-card px-3 py-2">
+      <div className="px-3 py-2">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             {isSchemaView && activeConnection ? (
-              <nav aria-label="Schema location" className="flex min-w-0 items-center gap-1.5 text-lg font-black leading-6">
+              <nav aria-label="Schema location" className="flex min-w-0 items-center gap-1.5 text-lg font-bold leading-6">
                 <button
                   className="min-w-0 truncate rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   type="button"
@@ -1398,11 +1587,11 @@ function PreviewWorkspace({
                 >
                   {activeConnection.name}
                 </button>
-                <span className="text-muted-foreground">/</span>
+                <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 truncate">{selectedSchema}</span>
               </nav>
             ) : selectedTable ? (
-              <nav aria-label="Table location" className="flex min-w-0 items-center gap-1.5 text-lg font-black leading-6">
+              <nav aria-label="Table location" className="flex min-w-0 items-center gap-1.5 text-lg font-bold leading-6">
                 {activeConnection ? (
                   <>
                     <button
@@ -1412,7 +1601,7 @@ function PreviewWorkspace({
                     >
                       {activeConnection.name}
                     </button>
-                    <span className="text-muted-foreground">/</span>
+                    <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
                   </>
                 ) : null}
                 <button
@@ -1422,13 +1611,18 @@ function PreviewWorkspace({
                 >
                   {selectedTable.table_schema}
                 </button>
-                <span className="text-muted-foreground">/</span>
+                <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+                {selectedTable.table_type !== "INTERNAL" && !selectedTable.table_name.startsWith("ducklake_") ? (
+                  <WaveIcon className="size-4 shrink-0 text-info-foreground-muted" />
+                ) : (
+                  <Table2 className="size-4 shrink-0 text-muted-foreground" />
+                )}
                 <span className="min-w-0 truncate">{selectedTable.table_name}</span>
               </nav>
             ) : isCatalogView ? (
-              <h2 className="truncate text-lg font-black leading-6">{activeConnection?.name}</h2>
+              <h2 className="truncate text-lg font-bold leading-6">{activeConnection?.name}</h2>
             ) : (
-              <h2 className="truncate text-lg font-black leading-6">Select a table</h2>
+              <h2 className="truncate text-lg font-bold leading-6">Select a table</h2>
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -1447,9 +1641,23 @@ function PreviewWorkspace({
         </div>
       </div>
 
-      {isSchemaView ? null : (
-        <div className="flex gap-1 overflow-x-auto border-b border-border bg-card px-2.5">
-          {WORKSPACE_TABS.map((tab) => (
+      {isSchemaView || isCatalogView ? null : (
+        <>
+          {isDucklake && ducklakeStorage ? (
+            <div className="flex items-center gap-3 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
+              {ducklakeStorage.has_primary_key ? (
+                <span className="inline-flex items-center gap-1">
+                  <KeyRound className="size-3" />
+                  has PK
+                </span>
+              ) : null}
+              <span>{ducklakeStorage.column_count} columns</span>
+              {ducklakeStorage.row_count > 0 ? <span>{ducklakeStorage.row_count.toLocaleString()} rows</span> : null}
+              <span>{formatBytes(ducklakeStorage.estimated_size)}</span>
+            </div>
+          ) : null}
+          <div className="flex gap-1 overflow-x-auto border-b border-border px-2.5">
+            {visibleTabs.map((tab) => (
             <button
               className={cn(
                 "inline-flex h-9 shrink-0 items-center gap-1.5 border-b-2 border-transparent px-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground",
@@ -1464,6 +1672,7 @@ function PreviewWorkspace({
             </button>
           ))}
         </div>
+        </>
       )}
 
       <div className="min-h-0 flex-1 overflow-hidden">
@@ -1474,8 +1683,8 @@ function PreviewWorkspace({
         ) : (
           <>
             {activeTab === "preview" ? <PreviewPanel preview={preview} /> : null}
-            {activeTab === "metadata" ? <MetadataPanel selectedTable={selectedTable} preview={preview} /> : null}
-            {activeTab === "query" ? <QueryPanel selectedTable={selectedTable} /> : null}
+            {activeTab === "columns" ? <ColumnsPanel selectedTable={selectedTable} preview={preview} ducklakeColumns={ducklakeColumns} ducklakeStats={ducklakeStats} /> : null}
+            {activeTab === "history" ? <HistoryPanel snapshots={ducklakeSnapshots} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
           </>
         )}
       </div>
@@ -1514,7 +1723,11 @@ function SchemaTablesPanel({
                   type="button"
                   onClick={() => void onPreviewTable(table)}
                 >
-                  <Table2 className="size-3.5 shrink-0 text-muted-foreground" />
+                  {table.table_type !== "INTERNAL" && !table.table_name.startsWith("ducklake_") ? (
+                    <WaveIcon className="size-3.5 shrink-0 text-info-foreground-muted" />
+                  ) : (
+                    <Table2 className="size-3.5 shrink-0 text-muted-foreground" />
+                  )}
                   <span className="truncate">{table.table_name}</span>
                 </button>
               </TableCell>
@@ -1597,47 +1810,74 @@ function PreviewPanel({ preview }: { preview: PreviewState }): React.ReactElemen
   );
 }
 
-function MetadataPanel({
+function ColumnsPanel({
   selectedTable,
   preview,
+  ducklakeColumns,
+  ducklakeStats,
 }: {
   selectedTable: RemoteTable | null;
   preview: PreviewState;
+  ducklakeColumns: ColumnDetail[];
+  ducklakeStats: ColumnStat[];
 }): React.ReactElement {
   if (!selectedTable) {
-    return <EmptyWorkspacePanel icon={Info} title="Select a table" />;
+    return <EmptyWorkspacePanel icon={Table2} title="Select a table" />;
   }
 
-  const items = [
-    ["Schema", selectedTable.table_schema],
-    ["Table", selectedTable.table_name],
-    ["Type", selectedTable.table_type || "TABLE"],
-    ["Preview limit", `${PREVIEW_LIMIT} rows`],
-    ["Loaded rows", `${preview.result?.rows.length ?? 0}`],
-    ["Loaded columns", `${preview.result?.columns.length ?? 0}`],
-  ];
+  const statsByColumn = new Map(ducklakeStats.map((s) => [s.column_name, s]));
+  const hasStats = ducklakeStats.length > 0;
+
+  if (ducklakeColumns.length > 0) {
+    return (
+      <div className="h-full overflow-auto">
+        <Table>
+          <TableHeader className="sticky top-0 z-10 bg-card">
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="w-12 text-right">#</TableHead>
+              <TableHead>Column</TableHead>
+              <TableHead>Type</TableHead>
+              <TableHead className="w-28">Nullable</TableHead>
+              {hasStats ? <TableHead className="w-36">Min</TableHead> : null}
+              {hasStats ? <TableHead className="w-36">Max</TableHead> : null}
+              <TableHead className="w-32">Default</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {ducklakeColumns.map((column) => {
+              const stat = statsByColumn.get(column.column_name);
+              return (
+                <TableRow key={column.column_name}>
+                  <TableCell className="text-right text-xs font-semibold text-muted-foreground">{column.ordinal_position}</TableCell>
+                  <TableCell className="font-semibold">{column.column_name}</TableCell>
+                  <TableCell className="text-muted-foreground">{column.data_type}</TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {stat?.contains_null ?? (column.is_nullable === "YES") ? "yes" : "no"}
+                  </TableCell>
+                  {hasStats ? <TableCell className="font-mono text-xs text-muted-foreground" title={stat?.min ?? undefined}>{truncateStat(stat?.min ?? null)}</TableCell> : null}
+                  {hasStats ? <TableCell className="font-mono text-xs text-muted-foreground" title={stat?.max ?? undefined}>{truncateStat(stat?.max ?? null)}</TableCell> : null}
+                  <TableCell className="truncate text-muted-foreground">{column.column_default ?? "\u2014"}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </div>
+    );
+  }
+
   const columnMetadata = preview.result?.columnMetadata ?? [];
 
   return (
     <div className="h-full overflow-auto">
-      <dl className="grid border-b border-border sm:grid-cols-2">
-        {items.map(([label, value]) => (
-          <div className="grid gap-1 border-b border-border px-3 py-2 last:border-b-0 sm:grid-cols-[120px_1fr] sm:odd:border-r sm:[&:nth-last-child(-n+2)]:border-b-0" key={label}>
-            <dt className="text-sm font-semibold text-muted-foreground">{label}</dt>
-            <dd className="min-w-0 break-words text-sm font-medium">{value}</dd>
-          </div>
-        ))}
-      </dl>
-
       {columnMetadata.length > 0 ? (
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-card">
             <TableRow className="hover:bg-transparent">
-              <TableHead className="w-16 text-right">#</TableHead>
+              <TableHead className="w-12 text-right">#</TableHead>
               <TableHead>Column</TableHead>
               <TableHead>Type</TableHead>
               <TableHead className="w-28">Nullable</TableHead>
-              <TableHead className="w-28 text-right">Values</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1649,29 +1889,64 @@ function MetadataPanel({
                 <TableCell className="text-muted-foreground">
                   {column.nullable === null ? "unknown" : column.nullable ? "yes" : "no"}
                 </TableCell>
-                <TableCell className="text-right text-muted-foreground">{preview.result?.rows.length ?? 0}</TableCell>
               </TableRow>
             ))}
           </TableBody>
         </Table>
-      ) : null}
+      ) : (
+        <div className="grid h-full place-items-center text-sm text-muted-foreground">Loading columns.</div>
+      )}
     </div>
   );
 }
 
-function QueryPanel({ selectedTable }: { selectedTable: RemoteTable | null }): React.ReactElement {
-  if (!selectedTable) {
-    return <EmptyWorkspacePanel icon={FileCode2} title="Select a table" />;
+function HistoryPanel({
+  snapshots,
+  loading,
+  selectedTable,
+}: {
+  snapshots: SnapshotRow[];
+  loading: boolean;
+  selectedTable: RemoteTable | null;
+}): React.ReactElement {
+  if (loading) {
+    return (
+      <div className="grid h-full place-items-center">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" />
+      </div>
+    );
   }
 
-  const qualifiedName = `${quoteIdentifier(selectedTable.table_schema)}.${quoteIdentifier(selectedTable.table_name)}`;
-  const query = `SELECT *\nFROM ${qualifiedName}\nLIMIT ${PREVIEW_LIMIT};`;
+  if (!selectedTable) {
+    return <EmptyWorkspacePanel icon={History} title="Select a table" />;
+  }
+
+  if (snapshots.length === 0) {
+    return <EmptyWorkspacePanel icon={History} title="No snapshot history available" />;
+  }
 
   return (
     <div className="h-full overflow-auto">
-      <pre className="overflow-auto p-3 text-sm leading-6 font-mono">
-        <code>{highlightSql(query)}</code>
-      </pre>
+      <Table>
+        <TableHeader className="sticky top-0 z-10 bg-card">
+          <TableRow className="hover:bg-transparent">
+            <TableHead className="w-24 text-right">Snapshot</TableHead>
+            <TableHead>Timestamp</TableHead>
+            <TableHead>Author</TableHead>
+            <TableHead>Message</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {snapshots.map((snapshot) => (
+            <TableRow key={snapshot.snapshot_id}>
+              <TableCell className="text-right font-mono text-xs text-muted-foreground">{snapshot.snapshot_id}</TableCell>
+              <TableCell className="font-semibold">{snapshot.snapshot_time}</TableCell>
+              <TableCell className="text-muted-foreground">{snapshot.author ?? "\u2014"}</TableCell>
+              <TableCell className="text-muted-foreground">{snapshot.commit_message ?? "\u2014"}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -1998,6 +2273,34 @@ function getVaultMeta(state: TokenVaultState): {
   return { Icon: ShieldCheck, badgeVariant: "outline", label: "No saved token" };
 }
 
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier.replaceAll('"', '""')}"`;
+function WaveIcon({ className }: { className?: string }): React.ReactElement {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={2}
+      viewBox="0 0 24 24"
+    >
+      <path d="M2 6C2.6 6.5 3.2 7 4.5 7C7 7 7 5 9.5 5C10.8 5 11.4 5.5 12 6C12.6 6.5 13.2 7 14.5 7C17 7 17 5 19.5 5C20.8 5 21.4 5.5 22 6" />
+      <path d="M2 18C2.6 18.5 3.2 19 4.5 19C7 19 7 17 9.5 17C10.8 17 11.4 17.5 12 18C12.6 18.5 13.2 19 14.5 19C17 19 17 17 19.5 17C20.8 17 21.4 17.5 22 18" />
+      <path d="M2 12C2.6 12.5 3.2 13 4.5 13C7 13 7 11 9.5 11C10.8 11 11.4 11.5 12 12C12.6 12.5 13.2 13 14.5 13C17 13 17 11 19.5 11C20.8 11 21.4 11.5 22 12" />
+    </svg>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  const n = typeof bytes === "bigint" ? Number(bytes) : bytes;
+  if (n === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1);
+  const size = n / 1024 ** i;
+  return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function truncateStat(value: string | null): string {
+  if (value === null) return "\u2014";
+  return value.length > 24 ? `${value.slice(0, 24)}\u2026` : value;
 }
