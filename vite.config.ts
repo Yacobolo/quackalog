@@ -17,9 +17,11 @@ export default defineConfig(({ mode }) => {
       },
     },
     define: {
-      "import.meta.env.VITE_QUACK_URI": JSON.stringify(rawEnv.VITE_QUACK_URI || rawEnv.uri || ""),
+      "import.meta.env.VITE_QUACK_URI": JSON.stringify(
+        rawEnv.VITE_QUACK_URI || process.env.VITE_QUACK_URI || rawEnv.uri || process.env.uri || "",
+      ),
       "import.meta.env.VITE_QUACK_TOKEN": JSON.stringify(
-        isProduction ? "" : rawEnv.VITE_QUACK_TOKEN || rawEnv.token || "",
+        isProduction ? "" : rawEnv.VITE_QUACK_TOKEN || process.env.VITE_QUACK_TOKEN || rawEnv.token || process.env.token || "",
       ),
     },
   };

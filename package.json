@@ -5,11 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:local": "node scripts/dev-local.mjs",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "seed:ducklake": "node scripts/seed-ducklake.mjs"
   },
   "dependencies": {
     "@duckdb/duckdb-wasm": "^1.33.1-dev55.0",
+    "@duckdb/node-api": "^1.5.3-r.3",
     "@primer/primitives": "^11.9.0",
     "@radix-ui/react-slot": "^1.2.4",
     "@tanstack/react-table": "^8.21.3",

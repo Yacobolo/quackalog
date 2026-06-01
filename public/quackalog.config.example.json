@@ -1,0 +1,13 @@
+{
+  "activeCatalog": "local seed",
+  "catalogs": [
+    {
+      "name": "remote dev",
+      "endpoint": "quack:your-remote-dev-host.example.com:443"
+    },
+    {
+      "name": "local seed",
+      "endpoint": "quack:127.0.0.1:7443"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.quackalog-seed/
+public/quackalog.config.json
 .playwright-cli/
 .DS_Store
 .env

@@ -158,7 +158,7 @@ export class QuackClient {
   }
 
   async getTableStats(schema: string, table: string): Promise<ColumnStat[]> {
-    const metaDb = await this.getDucklakeMetaDb();
+    const meta = await this.getDucklakeMetaPrefix();
     const remoteSql = `
       SELECT
         c.column_name,
@@ -174,10 +174,10 @@ export class QuackClient {
         0 AS count,
         0 AS null_percentage,
         cs.contains_null
-      FROM ${metaDb}.public.ducklake_table t
-      JOIN ${metaDb}.public.ducklake_schema s ON t.schema_id = s.schema_id
+      FROM ${meta}.ducklake_table t
+      JOIN ${meta}.ducklake_schema s ON t.schema_id = s.schema_id
       JOIN information_schema."columns" c ON c.table_schema = s.schema_name AND c.table_name = t.table_name
-      JOIN ${metaDb}.public.ducklake_table_column_stats cs ON t.table_id = cs.table_id AND cs.column_id = c.ordinal_position
+      JOIN ${meta}.ducklake_table_column_stats cs ON t.table_id = cs.table_id AND cs.column_id = c.ordinal_position
       WHERE t.end_snapshot IS NULL
         AND s.schema_name = ${sqlString(schema)}
         AND t.table_name = ${sqlString(table)}
@@ -215,14 +215,14 @@ export class QuackClient {
         AND NOT internal
     `);
 
-    const metaDb = await this.getDucklakeMetaDb();
+    const meta = await this.getDucklakeMetaPrefix();
     const [dlRow] = await this.queryRemoteRows<Pick<TableStorage, "row_count" | "estimated_size">>(`
       SELECT
         COALESCE(st.record_count, 0) AS row_count,
         COALESCE(st.file_size_bytes, 0) AS estimated_size
-      FROM ${metaDb}.public.ducklake_table t
-      JOIN ${metaDb}.public.ducklake_schema s ON t.schema_id = s.schema_id
-      LEFT JOIN ${metaDb}.public.ducklake_table_stats st ON t.table_id = st.table_id
+      FROM ${meta}.ducklake_table t
+      JOIN ${meta}.ducklake_schema s ON t.schema_id = s.schema_id
+      LEFT JOIN ${meta}.ducklake_table_stats st ON t.table_id = st.table_id
       WHERE t.end_snapshot IS NULL
         AND s.schema_name = ${sqlString(schema)}
         AND t.table_name = ${sqlString(table)}
@@ -237,14 +237,14 @@ export class QuackClient {
   }
 
   async getSnapshotHistory(schema: string, table: string): Promise<SnapshotRow[]> {
-    const metaDb = await this.getDucklakeMetaDb();
+    const meta = await this.getDucklakeMetaPrefix();
 
     return this.queryRemoteRows<SnapshotRow>(`
       SELECT DISTINCT s.snapshot_id, s.snapshot_time, sc.author, sc.commit_message
-      FROM ${metaDb}.public.ducklake_table t
-      JOIN ${metaDb}.public.ducklake_schema sch ON t.schema_id = sch.schema_id
-      CROSS JOIN ${metaDb}.public.ducklake_snapshot s
-      LEFT JOIN ${metaDb}.public.ducklake_snapshot_changes sc ON s.snapshot_id = sc.snapshot_id
+      FROM ${meta}.ducklake_table t
+      JOIN ${meta}.ducklake_schema sch ON t.schema_id = sch.schema_id
+      CROSS JOIN ${meta}.ducklake_snapshot s
+      LEFT JOIN ${meta}.ducklake_snapshot_changes sc ON s.snapshot_id = sc.snapshot_id
       WHERE t.end_snapshot IS NULL
         AND sch.schema_name = ${sqlString(schema)}
         AND t.table_name = ${sqlString(table)}
@@ -254,6 +254,7 @@ export class QuackClient {
   }
 
   private ducklakeMetaDb: string | null = null;
+  private ducklakeMetaSchema: string | null = null;
 
   private async getDucklakeMetaDb(): Promise<string> {
     if (this.ducklakeMetaDb) return this.ducklakeMetaDb;
@@ -266,6 +267,29 @@ export class QuackClient {
 
     this.ducklakeMetaDb = rows[0]?.database_name ?? "__ducklake_metadata_unknown";
     return this.ducklakeMetaDb;
+  }
+
+  private async getDucklakeMetaSchema(): Promise<string> {
+    if (this.ducklakeMetaSchema) return this.ducklakeMetaSchema;
+
+    const metaDb = await this.getDucklakeMetaDb();
+    const rows = await this.queryRemoteRows<{ schema_name: string }>(`
+      SELECT DISTINCT schema_name
+      FROM duckdb_tables()
+      WHERE database_name = ${sqlString(metaDb)}
+        AND table_name = 'ducklake_table'
+      ORDER BY CASE WHEN schema_name = 'public' THEN 0 ELSE 1 END, schema_name
+    `);
+
+    this.ducklakeMetaSchema = rows[0]?.schema_name ?? "public";
+    return this.ducklakeMetaSchema;
+  }
+
+  private async getDucklakeMetaPrefix(): Promise<string> {
+    const metaDb = await this.getDucklakeMetaDb();
+    const metaSchema = await this.getDucklakeMetaSchema();
+
+    return `${quoteIdentifier(metaDb)}.${quoteIdentifier(metaSchema)}`;
   }
 
   private async queryRemoteRows<T extends Record<string, unknown>>(remoteSql: string): Promise<T[]> {

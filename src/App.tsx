@@ -57,6 +57,7 @@ import {
   tableKey,
   warmDuckDB,
 } from "@/lib/quack-client";
+import { loadRuntimeCatalogConfig, type RuntimeCatalog } from "@/lib/runtime-config";
 import { readStoredString, writeStoredString } from "@/lib/storage";
 import {
   forgetTokenVaultRecord,
@@ -92,6 +93,11 @@ type ConnectionProfile = {
   endpoint: string;
 };
 
+type BootstrapConnection = {
+  name: string;
+  endpoint: string;
+};
+
 const DEFAULT_URI = import.meta.env.VITE_QUACK_URI || "";
 const DEV_TOKEN = import.meta.env.DEV ? import.meta.env.VITE_QUACK_TOKEN || "" : "";
 const ENDPOINT_KEY = "quackalog.endpoint";
@@ -115,6 +121,7 @@ export function App(): React.ReactElement {
   const previewRunRef = useRef(0);
   const lockTimerRef = useRef<number | null>(null);
   const autoConnectRef = useRef(false);
+  const bootstrappedConnectionRef = useRef(false);
   const [connections, setConnections] = useState<ConnectionProfile[]>(() => readStoredConnections());
   const [activeConnectionId, setActiveConnectionId] = useState(() => readStoredActiveConnectionId());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readStoredString(SIDEBAR_COLLAPSED_KEY, "true") === "true");
@@ -171,6 +178,90 @@ export function App(): React.ReactElement {
   useEffect(() => {
     writeStoredString(ACTIVE_CONNECTION_KEY, isCreatingConnection ? "" : activeConnectionId);
   }, [activeConnectionId, isCreatingConnection]);
+
+  useEffect(() => {
+    const bootstrap = readBootstrapConnection();
+
+    if (!bootstrap) {
+      return;
+    }
+
+    bootstrappedConnectionRef.current = true;
+    const current = readStoredConnections();
+    const existing = current.find((connection) => connection.endpoint === bootstrap.endpoint);
+    const profile = {
+      id: existing?.id ?? `bootstrap-${hashString(bootstrap.endpoint)}`,
+      name: bootstrap.name,
+      endpoint: bootstrap.endpoint,
+    };
+    const next = existing
+      ? current.map((connection) => (connection.id === existing.id ? profile : connection))
+      : [...current, profile];
+    const hasSavedToken = hasTokenVaultRecord(profile.id);
+
+    setIsCreatingConnection(false);
+    setConnections(next);
+    writeStoredConnections(next);
+    writeStoredString(ACTIVE_CONNECTION_KEY, profile.id);
+    setActiveConnectionId(profile.id);
+    setConnectionName(profile.name);
+    setEndpoint(profile.endpoint);
+    setSavedTokenExists(hasSavedToken);
+    setConnectionMode(hasSavedToken ? "unlock" : "paste");
+    setVaultState(hasSavedToken ? "locked" : "absent");
+    setMessage({
+      kind: "info",
+      text: DEV_TOKEN
+        ? `Loaded ${profile.name}. Connecting with the local dev token.`
+        : `Loaded ${profile.name}. Add a token to connect.`,
+    });
+    setIsConnectionDialogOpen(!DEV_TOKEN);
+
+    removeBootstrapConnectionParams();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void loadRuntimeCatalogConfig().then((config) => {
+      if (cancelled || config.catalogs.length === 0 || bootstrappedConnectionRef.current) {
+        return;
+      }
+
+      const current = readStoredConnections();
+      const next = mergeRuntimeCatalogs(current, config.catalogs);
+      const activeFromConfig = config.activeCatalog
+        ? next.find((connection) => connection.id === config.activeCatalog || connection.name === config.activeCatalog)
+        : null;
+      const activeStillExists = next.some((connection) => connection.id === activeConnectionId);
+      const nextActive = activeFromConfig ?? (activeStillExists ? next.find((connection) => connection.id === activeConnectionId) : null) ?? next[0];
+
+      setConnections(next);
+      writeStoredConnections(next);
+      setIsCreatingConnection(false);
+      setIsConnectionDialogOpen(false);
+
+      if (nextActive) {
+        writeStoredString(ACTIVE_CONNECTION_KEY, nextActive.id);
+        setActiveConnectionId(nextActive.id);
+        setConnectionName(nextActive.name);
+        setEndpoint(nextActive.endpoint);
+        setSavedTokenExists(hasTokenVaultRecord(nextActive.id));
+        setConnectionMode(hasTokenVaultRecord(nextActive.id) ? "unlock" : "paste");
+        setVaultState(hasTokenVaultRecord(nextActive.id) ? "locked" : "absent");
+      }
+
+      setMessage({
+        kind: "info",
+        text: `Loaded ${config.catalogs.length} ${config.catalogs.length === 1 ? "catalog" : "catalogs"} from local config.`,
+      });
+      tryAutoConnect();
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (isCreatingConnection) {
@@ -279,8 +370,6 @@ export function App(): React.ReactElement {
       return;
     }
 
-    autoConnectRef.current = true;
-
     const savedConnectionId = readStoredActiveConnectionId();
     const savedConnections = readStoredConnections();
     const profile = savedConnections.find((c) => c.id === savedConnectionId);
@@ -289,6 +378,7 @@ export function App(): React.ReactElement {
       return;
     }
 
+    autoConnectRef.current = true;
     setConnectionState("connecting");
     setMessage({ kind: "info", text: `Connecting to ${profile.name}.` });
 
@@ -2091,6 +2181,69 @@ function groupTablesBySchema(tables: RemoteTable[]): Array<[string, RemoteTable[
   return Array.from(grouped.entries());
 }
 
+function readBootstrapConnection(): BootstrapConnection | null {
+  const params = new URLSearchParams(window.location.search);
+  const endpoint = (params.get("catalog_uri") ?? params.get("quackalog_catalog_uri") ?? "").trim();
+
+  if (!endpoint) {
+    return null;
+  }
+
+  const requestedName = (params.get("catalog_name") ?? params.get("quackalog_catalog_name") ?? "").trim();
+
+  return {
+    name: requestedName || getConnectionAlias(endpoint),
+    endpoint,
+  };
+}
+
+function removeBootstrapConnectionParams(): void {
+  const url = new URL(window.location.href);
+  const params = [
+    "catalog_uri",
+    "catalog_name",
+    "catalog_connect",
+    "quackalog_catalog_uri",
+    "quackalog_catalog_name",
+    "quackalog_catalog_connect",
+  ];
+
+  for (const param of params) {
+    url.searchParams.delete(param);
+  }
+
+  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function mergeRuntimeCatalogs(
+  storedConnections: ConnectionProfile[],
+  runtimeCatalogs: RuntimeCatalog[],
+): ConnectionProfile[] {
+  const byEndpoint = new Map(storedConnections.map((connection) => [connection.endpoint, connection]));
+  const next = [...storedConnections];
+
+  for (const catalog of runtimeCatalogs) {
+    const endpoint = catalog.endpoint.trim();
+    const existing = byEndpoint.get(endpoint);
+    const profile = {
+      id: existing?.id ?? `config-${hashString(endpoint)}`,
+      name: catalog.name.trim(),
+      endpoint,
+    };
+
+    if (existing) {
+      const index = next.findIndex((connection) => connection.id === existing.id);
+      next[index] = profile;
+    } else {
+      next.push(profile);
+    }
+
+    byEndpoint.set(endpoint, profile);
+  }
+
+  return next;
+}
+
 function readStoredConnections(): ConnectionProfile[] {
   try {
     const raw = window.localStorage.getItem(CONNECTIONS_KEY);
@@ -2154,6 +2307,16 @@ function createConnectionId(): string {
   }
 
   return `connection-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function hashString(value: string): string {
+  let hash = 0;
+
+  for (let i = 0; i < value.length; i += 1) {
+    hash = Math.imul(31, hash) + value.charCodeAt(i);
+  }
+
+  return Math.abs(hash).toString(36);
 }
 
 function getConnectionAlias(endpoint: string): string {
