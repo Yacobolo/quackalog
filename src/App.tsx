@@ -12,8 +12,10 @@ import {
   CheckCircle2,
   ChevronRight,
   Database,
-  History,
+  Files,
+  GitBranch,
   KeyRound,
+  LayoutPanelTop,
   LockKeyhole,
   Loader2,
   Monitor,
@@ -77,7 +79,7 @@ type TokenVaultState = "absent" | "memory" | "locked" | "unlocked";
 type ConnectionMode = "paste" | "unlock";
 type MessageKind = "info" | "success" | "warning" | "error";
 type ThemeMode = "light" | "dark" | "system";
-type WorkspaceTab = "preview" | "columns" | "metadata" | "history";
+type WorkspaceTab = "preview" | "schema" | "files" | "snapshots" | "layout" | "raw";
 
 type PreviewState = {
   isLoading: boolean;
@@ -141,9 +143,11 @@ const DEFAULT_VAULT_TTL_MINUTES = 30;
 const VAULT_TTL_OPTIONS = [15, 30, 60, 120];
 const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string; Icon: typeof Table2 }> = [
   { id: "preview", label: "Preview", Icon: Rows3 },
-  { id: "columns", label: "Columns", Icon: Table2 },
-  { id: "metadata", label: "Metadata", Icon: Database },
-  { id: "history", label: "History", Icon: History },
+  { id: "schema", label: "Schema", Icon: Table2 },
+  { id: "files", label: "Files", Icon: Files },
+  { id: "snapshots", label: "Snapshots", Icon: GitBranch },
+  { id: "layout", label: "Layout", Icon: LayoutPanelTop },
+  { id: "raw", label: "Raw", Icon: Database },
 ];
 
 export function App(): React.ReactElement {
@@ -2031,7 +2035,10 @@ function PreviewWorkspace({
   const isSchemaView = selectedSchema.length > 0;
   const isCatalogView = Boolean(activeConnection && !selectedSchema && !selectedTable);
   const isDucklake = selectedTable ? selectedTable.table_type !== "INTERNAL" : false;
-  const visibleTabs = WORKSPACE_TABS.filter((tab) => tab.id === "history" ? isDucklake : true);
+  const visibleTabs = WORKSPACE_TABS.filter((tab) =>
+    tab.id === "preview" || tab.id === "schema" || isDucklake,
+  );
+  const renderedTab = visibleTabs.some((tab) => tab.id === activeTab) ? activeTab : "schema";
 
   return (
     <section className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-background">
@@ -2106,7 +2113,7 @@ function PreviewWorkspace({
             <button
               className={cn(
                 "inline-flex h-9 shrink-0 items-center gap-1.5 border-b-2 border-transparent px-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground",
-                activeTab === tab.id && "border-primary text-foreground",
+                renderedTab === tab.id && "border-primary text-foreground",
               )}
               key={tab.id}
               type="button"
@@ -2128,9 +2135,11 @@ function PreviewWorkspace({
         ) : (
           <>
             {activeTab === "preview" ? <PreviewPanel preview={preview} /> : null}
-            {activeTab === "columns" ? <ColumnsPanel selectedTable={selectedTable} preview={preview} ducklakeColumns={ducklakeColumns} ducklakeStats={ducklakeStats} /> : null}
-            {activeTab === "metadata" ? <MetadataPanel metadata={ducklakeMetadata} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
-            {activeTab === "history" ? <HistoryPanel snapshots={ducklakeSnapshots} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
+            {renderedTab === "schema" ? <SchemaPanel selectedTable={selectedTable} preview={preview} ducklakeColumns={ducklakeColumns} ducklakeStats={ducklakeStats} ducklakeMetadata={ducklakeMetadata} isDucklake={isDucklake} /> : null}
+            {renderedTab === "files" ? <DucklakeFilesPanel metadata={ducklakeMetadata} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
+            {renderedTab === "snapshots" ? <DucklakeSnapshotsPanel metadata={ducklakeMetadata} loading={ducklakeMetaLoading} selectedTable={selectedTable} snapshots={ducklakeSnapshots} /> : null}
+            {renderedTab === "layout" ? <DucklakeLayoutPanel metadata={ducklakeMetadata} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
+            {renderedTab === "raw" ? <DucklakeRawPanel metadata={ducklakeMetadata} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
           </>
         )}
       </div>
@@ -2256,19 +2265,66 @@ function PreviewPanel({ preview }: { preview: PreviewState }): React.ReactElemen
   );
 }
 
-function ColumnsPanel({
+function SchemaPanel({
   selectedTable,
   preview,
   ducklakeColumns,
   ducklakeStats,
+  ducklakeMetadata,
+  isDucklake,
 }: {
   selectedTable: RemoteTable | null;
   preview: PreviewState;
   ducklakeColumns: ColumnDetail[];
   ducklakeStats: ColumnStat[];
+  ducklakeMetadata: DucklakeMetadata | null;
+  isDucklake: boolean;
 }): React.ReactElement {
   if (!selectedTable) {
     return <EmptyWorkspacePanel icon={Table2} title="Select a table" />;
+  }
+
+  const summary = getDucklakeMetadataSummary(ducklakeMetadata);
+  const ducklakeSchemaRows = isDucklake ? summary.columns : [];
+
+  if (ducklakeSchemaRows.length > 0) {
+    const activeColumns = ducklakeSchemaRows.filter((row) => row.end_snapshot === null || row.end_snapshot === undefined);
+    const nestedColumns = ducklakeSchemaRows.filter((row) => row.parent_column !== null && row.parent_column !== undefined);
+    const defaults = ducklakeSchemaRows.filter((row) => row.default_value !== null && row.default_value !== undefined && row.default_value !== "NULL");
+
+    return (
+      <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)]">
+        <div className="grid gap-2 border-b border-border px-3 py-2 sm:grid-cols-4">
+          <MetadataField label="Active columns" value={activeColumns.length} />
+          <MetadataField label="Nested fields" value={nestedColumns.length} />
+          <MetadataField label="Defaults" value={defaults.length} />
+          <MetadataField label="Column tags" value={summary.columnTags.length} />
+        </div>
+        <div className="min-h-0 overflow-auto">
+          <div className="grid gap-3 p-3">
+            <MetadataSectionTable
+              title="DuckLake columns"
+              rows={ducklakeSchemaRows}
+              preferredColumns={["column_order", "column_name", "column_type", "nulls_allowed", "default_value", "begin_snapshot", "end_snapshot", "parent_column"]}
+            />
+            {ducklakeStats.length > 0 ? (
+              <MetadataSectionTable
+                title="Column stats"
+                rows={ducklakeStats as unknown as PreviewRow[]}
+                preferredColumns={["column_name", "column_type", "min", "max", "contains_null", "null_percentage"]}
+              />
+            ) : null}
+            {summary.columnTags.length > 0 ? (
+              <MetadataSectionTable
+                title="Column tags"
+                rows={summary.columnTags}
+                preferredColumns={["column_id", "tag_name", "tag_value", "begin_snapshot", "end_snapshot"]}
+              />
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
   }
 
   const statsByColumn = new Map(ducklakeStats.map((s) => [s.column_name, s]));
@@ -2386,7 +2442,7 @@ function ColumnsPanel({
   );
 }
 
-function MetadataPanel({
+function DucklakeFilesPanel({
   metadata,
   loading,
   selectedTable,
@@ -2395,66 +2451,34 @@ function MetadataPanel({
   loading: boolean;
   selectedTable: RemoteTable | null;
 }): React.ReactElement {
-  const [view, setView] = useState<"overview" | "files" | "snapshots" | "raw">("overview");
+  const state = getDucklakePanelState(metadata, loading, selectedTable, Files, "No file metadata available");
+  if (state) return state;
 
-  if (loading) {
-    return (
-      <div className="grid h-full place-items-center">
-        <Loader2 className="size-5 animate-spin text-muted-foreground" />
-      </div>
-    );
-  }
-
-  if (!selectedTable) {
-    return <EmptyWorkspacePanel icon={Database} title="Select a table" />;
-  }
-
-  const sections = metadata?.sections.filter((section) => section.rows.length > 0) ?? [];
   const summary = getDucklakeMetadataSummary(metadata);
 
-  if (sections.length === 0) {
-    return <EmptyWorkspacePanel icon={Database} title="No DuckLake metadata available" />;
+  if (summary.dataFiles.length === 0 && summary.deleteFiles.length === 0 && summary.partitionValues.length === 0) {
+    return <EmptyWorkspacePanel icon={Files} title="No file metadata available" />;
   }
 
-  const navItems: Array<{ id: typeof view; label: string; count?: number }> = [
-    { id: "overview", label: "Overview" },
-    { id: "files", label: "Files", count: summary.dataFiles.length + summary.deleteFiles.length },
-    { id: "snapshots", label: "Snapshots", count: summary.snapshots.length },
-    { id: "raw", label: "Raw", count: sections.length },
-  ];
-
-  return (
-    <div className="grid h-full min-h-0 grid-cols-[180px_minmax(0,1fr)] overflow-hidden">
-      <div className="border-r border-border bg-muted/20 p-2">
-        <div className="grid gap-1">
-          {navItems.map((item) => (
-            <button
-              className={cn(
-                "flex h-8 items-center justify-between gap-2 rounded-md px-2 text-left text-sm font-semibold text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
-                view === item.id && "bg-sidebar-accent text-sidebar-accent-foreground",
-              )}
-              key={item.id}
-              type="button"
-              onClick={() => setView(item.id)}
-            >
-              <span className="truncate">{item.label}</span>
-              {item.count !== undefined ? <Badge variant="outline">{item.count}</Badge> : null}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="min-h-0 overflow-auto">
-        {view === "overview" ? <MetadataOverview summary={summary} /> : null}
-        {view === "files" ? <MetadataFilesView summary={summary} /> : null}
-        {view === "snapshots" ? <MetadataSnapshotsView summary={summary} /> : null}
-        {view === "raw" ? <MetadataRawView sections={sections} /> : null}
-      </div>
-    </div>
-  );
+  return <MetadataFilesView summary={summary} />;
 }
 
-function MetadataOverview({ summary }: { summary: DucklakeMetadataSummary }): React.ReactElement {
+function DucklakeLayoutPanel({
+  metadata,
+  loading,
+  selectedTable,
+}: {
+  metadata: DucklakeMetadata | null;
+  loading: boolean;
+  selectedTable: RemoteTable | null;
+}): React.ReactElement {
+  const state = getDucklakePanelState(metadata, loading, selectedTable, LayoutPanelTop, "No layout metadata available");
+  if (state) return state;
+
+  return <DucklakeLayoutView summary={getDucklakeMetadataSummary(metadata)} />;
+}
+
+function DucklakeLayoutView({ summary }: { summary: DucklakeMetadataSummary }): React.ReactElement {
   const latestSnapshot = summary.snapshots[0];
 
   return (
@@ -2489,17 +2513,16 @@ function MetadataOverview({ summary }: { summary: DucklakeMetadataSummary }): Re
         />
       </div>
 
-      <div className="overflow-hidden rounded-md border border-border">
-        <div className="flex items-center justify-between border-b border-border bg-muted/40 px-3 py-2">
-          <h3 className="text-sm font-bold">Current columns</h3>
-          <Badge variant="outline">{summary.columns.length} columns</Badge>
-        </div>
-        <MetadataRowsTable
-          rows={summary.columns}
-          preferredColumns={["column_order", "column_name", "column_type", "nulls_allowed", "default_value"]}
-          includeRemainingColumns={false}
-        />
-      </div>
+      <MetadataSectionTable
+        title="Partition columns"
+        rows={summary.partitionColumns}
+        preferredColumns={["partition_column_id", "column_id", "transform", "begin_snapshot", "end_snapshot"]}
+      />
+      <MetadataSectionTable
+        title="Sort expressions"
+        rows={summary.sortExpressions}
+        preferredColumns={["sort_id", "expression", "sort_direction", "null_order", "begin_snapshot", "end_snapshot"]}
+      />
     </div>
   );
 }
@@ -2553,6 +2576,78 @@ function MetadataSnapshotsView({ summary }: { summary: DucklakeMetadataSummary }
       />
     </div>
   );
+}
+
+function DucklakeSnapshotsPanel({
+  metadata,
+  loading,
+  selectedTable,
+  snapshots,
+}: {
+  metadata: DucklakeMetadata | null;
+  loading: boolean;
+  selectedTable: RemoteTable | null;
+  snapshots: SnapshotRow[];
+}): React.ReactElement {
+  const state = getDucklakePanelState(metadata, loading, selectedTable, GitBranch, "No snapshot metadata available");
+  if (state) return state;
+
+  const summary = getDucklakeMetadataSummary(metadata);
+
+  if (summary.snapshots.length > 0 || summary.snapshotChanges.length > 0 || summary.schemaVersions.length > 0) {
+    return <MetadataSnapshotsView summary={summary} />;
+  }
+
+  if (snapshots.length > 0) {
+    return <SnapshotHistoryTable snapshots={snapshots} />;
+  }
+
+  return <EmptyWorkspacePanel icon={GitBranch} title="No snapshot metadata available" />;
+}
+
+function DucklakeRawPanel({
+  metadata,
+  loading,
+  selectedTable,
+}: {
+  metadata: DucklakeMetadata | null;
+  loading: boolean;
+  selectedTable: RemoteTable | null;
+}): React.ReactElement {
+  const state = getDucklakePanelState(metadata, loading, selectedTable, Database, "No raw metadata available");
+  if (state) return state;
+
+  const sections = metadata?.sections.filter((section) => section.rows.length > 0) ?? [];
+
+  return <MetadataRawView sections={sections} />;
+}
+
+function getDucklakePanelState(
+  metadata: DucklakeMetadata | null,
+  loading: boolean,
+  selectedTable: RemoteTable | null,
+  Icon: typeof Database,
+  emptyTitle: string,
+): React.ReactElement | null {
+  if (loading) {
+    return (
+      <div className="grid h-full place-items-center">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (!selectedTable) {
+    return <EmptyWorkspacePanel icon={Icon} title="Select a table" />;
+  }
+
+  const sections = metadata?.sections.filter((section) => section.rows.length > 0) ?? [];
+
+  if (sections.length === 0) {
+    return <EmptyWorkspacePanel icon={Icon} title={emptyTitle} />;
+  }
+
+  return null;
 }
 
 function MetadataRawView({ sections }: { sections: DucklakeMetadata["sections"] }): React.ReactElement {
@@ -2673,31 +2768,11 @@ function MetadataRowsTable({
   );
 }
 
-function HistoryPanel({
+function SnapshotHistoryTable({
   snapshots,
-  loading,
-  selectedTable,
 }: {
   snapshots: SnapshotRow[];
-  loading: boolean;
-  selectedTable: RemoteTable | null;
 }): React.ReactElement {
-  if (loading) {
-    return (
-      <div className="grid h-full place-items-center">
-        <Loader2 className="size-5 animate-spin text-muted-foreground" />
-      </div>
-    );
-  }
-
-  if (!selectedTable) {
-    return <EmptyWorkspacePanel icon={History} title="Select a table" />;
-  }
-
-  if (snapshots.length === 0) {
-    return <EmptyWorkspacePanel icon={History} title="No snapshot history available" />;
-  }
-
   return (
     <div className="h-full overflow-auto">
       <Table>
@@ -3065,7 +3140,19 @@ function readStoredVaultTtlMinutes(): number {
 }
 
 function parseWorkspaceTab(value: string | null): WorkspaceTab | null {
-  if (value === "preview" || value === "columns" || value === "metadata" || value === "history") {
+  if (value === "columns") {
+    return "schema";
+  }
+
+  if (value === "history") {
+    return "snapshots";
+  }
+
+  if (value === "metadata") {
+    return "layout";
+  }
+
+  if (value === "preview" || value === "schema" || value === "files" || value === "snapshots" || value === "layout" || value === "raw") {
     return value;
   }
 
