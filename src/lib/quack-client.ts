@@ -67,6 +67,17 @@ export type SnapshotRow = {
   commit_message: string | null;
 };
 
+export type DucklakeMetadataSection = {
+  id: string;
+  label: string;
+  rows: PreviewRow[];
+};
+
+export type DucklakeMetadata = {
+  table_id: number | null;
+  sections: DucklakeMetadataSection[];
+};
+
 export const PREVIEW_LIMIT = 100;
 
 const MANUAL_BUNDLES: duckdb.DuckDBBundles = {
@@ -253,6 +264,70 @@ export class QuackClient {
     `);
   }
 
+  async getDucklakeMetadata(schema: string, table: string): Promise<DucklakeMetadata> {
+    const meta = await this.getDucklakeMetaPrefix();
+    const [tableRow] = await this.queryRemoteRows<{ table_id: number; begin_snapshot: number | null }>(`
+      SELECT t.table_id, t.begin_snapshot
+      FROM ${meta}.ducklake_table t
+      JOIN ${meta}.ducklake_schema sch ON t.schema_id = sch.schema_id
+      WHERE t.end_snapshot IS NULL
+        AND sch.schema_name = ${sqlString(schema)}
+        AND t.table_name = ${sqlString(table)}
+    `);
+
+    if (!tableRow) {
+      return { table_id: null, sections: [] };
+    }
+
+    const tableId = Number(tableRow.table_id);
+    const beginSnapshot = Number(tableRow.begin_snapshot ?? 0);
+    const tableFilter = `table_id = ${tableId}`;
+    const dataFileFilter = `data_file_id IN (SELECT data_file_id FROM ${meta}.ducklake_data_file WHERE table_id = ${tableId})`;
+    const sortFilter = `sort_id IN (SELECT sort_id FROM ${meta}.ducklake_sort_info WHERE table_id = ${tableId})`;
+    const snapshotFilter = `snapshot_id >= ${beginSnapshot}`;
+
+    const specs = [
+      metadataSpec("table", "Table", `${meta}.ducklake_table`, tableFilter),
+      metadataSpec("columns", "Columns", `${meta}.ducklake_column`, tableFilter),
+      metadataSpec("table-stats", "Table stats", `${meta}.ducklake_table_stats`, tableFilter),
+      metadataSpec("column-stats", "Column stats", `${meta}.ducklake_table_column_stats`, tableFilter),
+      metadataSpec("data-files", "Data files", `${meta}.ducklake_data_file`, tableFilter, "data_file_id"),
+      metadataSpec("delete-files", "Delete files", `${meta}.ducklake_delete_file`, tableFilter, "delete_file_id"),
+      metadataSpec("file-column-stats", "File column stats", `${meta}.ducklake_file_column_stats`, tableFilter, "data_file_id, column_id"),
+      metadataSpec("partition-values", "Partition values", `${meta}.ducklake_file_partition_value`, dataFileFilter, "data_file_id, partition_key_index"),
+      metadataSpec("partitions", "Partitions", `${meta}.ducklake_partition_info`, tableFilter, "partition_id"),
+      metadataSpec("partition-columns", "Partition columns", `${meta}.ducklake_partition_column`, tableFilter, "partition_key_index"),
+      metadataSpec("sort-info", "Sort info", `${meta}.ducklake_sort_info`, tableFilter, "sort_id"),
+      metadataSpec("sort-expressions", "Sort expressions", `${meta}.ducklake_sort_expression`, sortFilter, "sort_id, sort_key_index"),
+      metadataSpec("column-tags", "Column tags", `${meta}.ducklake_column_tag`, tableFilter, "column_id, key"),
+      metadataSpec("schema-versions", "Schema versions", `${meta}.ducklake_schema_versions`, tableFilter, "begin_snapshot"),
+      metadataSpec("snapshots", "Snapshots", `${meta}.ducklake_snapshot`, snapshotFilter, "snapshot_id DESC"),
+      metadataSpec("snapshot-changes", "Snapshot changes", `${meta}.ducklake_snapshot_changes`, snapshotFilter, "snapshot_id DESC"),
+      metadataSpec("inlined-data", "Inlined data tables", `${meta}.ducklake_inlined_data_tables`, tableFilter),
+    ];
+
+    const settled = await Promise.allSettled(
+      specs.map(async (spec) => ({
+        id: spec.id,
+        label: spec.label,
+        rows: await this.queryRemoteRows<PreviewRow>(`
+          SELECT *
+          FROM ${spec.source}
+          WHERE ${spec.where}
+          ORDER BY ${spec.orderBy}
+          LIMIT 100
+        `),
+      })),
+    );
+
+    return {
+      table_id: tableId,
+      sections: settled
+        .filter((result): result is PromiseFulfilledResult<DucklakeMetadataSection> => result.status === "fulfilled")
+        .map((result) => result.value),
+    };
+  }
+
   private ducklakeMetaDb: string | null = null;
   private ducklakeMetaSchema: string | null = null;
 
@@ -342,6 +417,16 @@ export class QuackClient {
       FROM remote.query(${sqlString(remoteSql)});
     `);
   }
+}
+
+function metadataSpec(id: string, label: string, source: string, where: string, orderBy = "1"): {
+  id: string;
+  label: string;
+  orderBy: string;
+  source: string;
+  where: string;
+} {
+  return { id, label, orderBy, source, where };
 }
 
 let duckDBPromise: Promise<duckdb.AsyncDuckDB> | null = null;

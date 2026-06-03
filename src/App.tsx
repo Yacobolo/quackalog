@@ -49,7 +49,7 @@ import {
   type PreviewRow,
   type ColumnStat,
   type ColumnDetail,
-  type TableStorage,
+  type DucklakeMetadata,
   type SnapshotRow,
   QuackClient,
   type RemoteTable,
@@ -61,10 +61,13 @@ import { loadRuntimeCatalogConfig, type RuntimeCatalog } from "@/lib/runtime-con
 import { readStoredString, writeStoredString } from "@/lib/storage";
 import {
   forgetTokenVaultRecord,
+  forgetTokenVaultSession,
   hasTokenVaultRecord,
   isTokenVaultSupported,
+  isTokenVaultSessionExpired,
   saveEncryptedToken,
   unlockEncryptedToken,
+  writeTokenVaultSession,
 } from "@/lib/token-vault";
 import { cn } from "@/lib/utils";
 
@@ -74,7 +77,7 @@ type TokenVaultState = "absent" | "memory" | "locked" | "unlocked";
 type ConnectionMode = "paste" | "unlock";
 type MessageKind = "info" | "success" | "warning" | "error";
 type ThemeMode = "light" | "dark" | "system";
-type WorkspaceTab = "preview" | "columns" | "history";
+type WorkspaceTab = "preview" | "columns" | "metadata" | "history";
 
 type PreviewState = {
   isLoading: boolean;
@@ -98,6 +101,30 @@ type BootstrapConnection = {
   endpoint: string;
 };
 
+type CatalogRoute = {
+  catalog: string;
+  schema?: string;
+  tab?: WorkspaceTab;
+  table?: string;
+};
+
+type DucklakeMetadataSummary = {
+  columnTags: PreviewRow[];
+  columns: PreviewRow[];
+  currentFileCount: number;
+  dataFiles: PreviewRow[];
+  deleteFiles: PreviewRow[];
+  historicalFileCount: number;
+  partitionColumns: PreviewRow[];
+  partitionValues: PreviewRow[];
+  schemaVersions: PreviewRow[];
+  snapshotChanges: PreviewRow[];
+  snapshots: PreviewRow[];
+  sortExpressions: PreviewRow[];
+  tableId: number | null;
+  totalFileBytes: number;
+};
+
 const DEFAULT_URI = import.meta.env.VITE_QUACK_URI || "";
 const DEV_TOKEN = import.meta.env.DEV ? import.meta.env.VITE_QUACK_TOKEN || "" : "";
 const ENDPOINT_KEY = "quackalog.endpoint";
@@ -106,13 +133,16 @@ const ACTIVE_CONNECTION_KEY = "quackalog.active-connection";
 const THEME_KEY = "quackalog.theme";
 const SIDEBAR_COLLAPSED_KEY = "quackalog.sidebar-collapsed";
 const SIDEBAR_WIDTH_KEY = "quackalog.sidebar-width";
+const VAULT_TTL_KEY = "quackalog.vault-ttl-minutes";
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 500;
 const SIDEBAR_DEFAULT_WIDTH = 300;
-const TOKEN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_VAULT_TTL_MINUTES = 30;
+const VAULT_TTL_OPTIONS = [15, 30, 60, 120];
 const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string; Icon: typeof Table2 }> = [
   { id: "preview", label: "Preview", Icon: Rows3 },
   { id: "columns", label: "Columns", Icon: Table2 },
+  { id: "metadata", label: "Metadata", Icon: Database },
   { id: "history", label: "History", Icon: History },
 ];
 
@@ -122,6 +152,7 @@ export function App(): React.ReactElement {
   const lockTimerRef = useRef<number | null>(null);
   const autoConnectRef = useRef(false);
   const bootstrappedConnectionRef = useRef(false);
+  const routeAppliedRef = useRef("");
   const [connections, setConnections] = useState<ConnectionProfile[]>(() => readStoredConnections());
   const [activeConnectionId, setActiveConnectionId] = useState(() => readStoredActiveConnectionId());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readStoredString(SIDEBAR_COLLAPSED_KEY, "true") === "true");
@@ -140,6 +171,7 @@ export function App(): React.ReactElement {
   const [passphrase, setPassphrase] = useState("");
   const [vaultSecret, setVaultSecret] = useState("");
   const [rememberToken, setRememberToken] = useState(false);
+  const [vaultTtlMinutes, setVaultTtlMinutes] = useState(() => readStoredVaultTtlMinutes());
   const [savedTokenExists, setSavedTokenExists] = useState(() => false);
   const [vaultState, setVaultState] = useState<TokenVaultState>(() =>
     "absent",
@@ -158,17 +190,19 @@ export function App(): React.ReactElement {
   const [selectedTableKey, setSelectedTableKey] = useState("");
   const [catalogSearch, setCatalogSearch] = useState("");
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("preview");
+  const [routeRevision, setRouteRevision] = useState(0);
   const [isConnectionDialogOpen, setIsConnectionDialogOpen] = useState(() => connections.length === 0);
+  const [isUnlockDialogOpen, setIsUnlockDialogOpen] = useState(false);
   const [preview, setPreview] = useState<PreviewState>({
     isLoading: false,
     table: null,
     result: null,
   });
   const [ducklakeStats, setDucklakeStats] = useState<ColumnStat[]>([]);
-  const [ducklakeStorage, setDucklakeStorage] = useState<TableStorage | null>(null);
   const [ducklakeColumns, setDucklakeColumns] = useState<ColumnDetail[]>([]);
   const [ducklakeMetaLoading, setDucklakeMetaLoading] = useState(false);
   const [ducklakeSnapshots, setDucklakeSnapshots] = useState<SnapshotRow[]>([]);
+  const [ducklakeMetadata, setDucklakeMetadata] = useState<DucklakeMetadata | null>(null);
   const vaultSupported = isTokenVaultSupported();
 
   useEffect(() => {
@@ -178,6 +212,19 @@ export function App(): React.ReactElement {
   useEffect(() => {
     writeStoredString(ACTIVE_CONNECTION_KEY, isCreatingConnection ? "" : activeConnectionId);
   }, [activeConnectionId, isCreatingConnection]);
+
+  useEffect(() => {
+    writeStoredString(VAULT_TTL_KEY, String(vaultTtlMinutes));
+  }, [vaultTtlMinutes]);
+
+  useEffect(() => {
+    if (vaultState !== "unlocked" || !activeConnectionId) {
+      return;
+    }
+
+    writeTokenVaultSession(activeConnectionId, getVaultTtlMs(vaultTtlMinutes));
+    startLockTimer();
+  }, [vaultTtlMinutes]);
 
   useEffect(() => {
     const bootstrap = readBootstrapConnection();
@@ -295,6 +342,22 @@ export function App(): React.ReactElement {
   }, [activeConnectionId, connections, isCreatingConnection, vaultSecret]);
 
   useEffect(() => {
+    const activeConnection = connections.find((connection) => connection.id === activeConnectionId) ?? null;
+
+    if (!activeConnection || isCreatingConnection || vaultSecret || !hasTokenVaultRecord(activeConnection.id)) {
+      return;
+    }
+
+    setIsUnlockDialogOpen(true);
+    setMessage({
+      kind: "info",
+      text: isTokenVaultSessionExpired(activeConnection.id)
+        ? "Vault session expired. Enter your passphrase to reconnect."
+        : "Enter your passphrase to unlock the saved token.",
+    });
+  }, [activeConnectionId, connections, isCreatingConnection, vaultSecret]);
+
+  useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const applyTheme = () => {
       const resolvedTheme = resolveTheme(theme);
@@ -365,6 +428,91 @@ export function App(): React.ReactElement {
     };
   }, [isResizing]);
 
+  useEffect(() => {
+    const onPopState = (): void => {
+      setRouteRevision((current) => current + 1);
+    };
+
+    window.addEventListener("popstate", onPopState);
+
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    const route = readCatalogRoute();
+
+    if (!route) {
+      routeAppliedRef.current = "";
+
+      if (routeRevision > 0) {
+        handleSelectCatalog({ updateUrl: false });
+      }
+
+      return;
+    }
+
+    if (connections.length === 0) {
+      return;
+    }
+
+    const matchedConnection = findConnectionForRoute(connections, route.catalog);
+
+    if (!matchedConnection) {
+      return;
+    }
+
+    if (matchedConnection.id !== activeConnectionId) {
+      setIsCreatingConnection(false);
+      closeActiveClientForSwitch();
+      setActiveConnectionId(matchedConnection.id);
+      setConnectionName(matchedConnection.name);
+      setEndpoint(matchedConnection.endpoint);
+      return;
+    }
+
+    if (!route.schema) {
+      const routeKey = `catalog:${matchedConnection.id}:${route.tab ?? ""}`;
+
+      if (routeAppliedRef.current !== routeKey) {
+        routeAppliedRef.current = routeKey;
+        if (route.tab) setActiveTab(route.tab);
+        handleSelectCatalog({ updateUrl: false });
+      }
+
+      return;
+    }
+
+    if (!route.table) {
+      const routeKey = `schema:${matchedConnection.id}:${route.schema}:${route.tab ?? ""}`;
+
+      if (routeAppliedRef.current !== routeKey && tables.some((table) => table.table_schema === route.schema)) {
+        routeAppliedRef.current = routeKey;
+        if (route.tab) setActiveTab(route.tab);
+        handleSelectSchema(route.schema, { updateUrl: false });
+      }
+
+      return;
+    }
+
+    if (!clientRef.current || connectionState !== "ready") {
+      return;
+    }
+
+    const routeKey = `table:${matchedConnection.id}:${route.schema}:${route.table}:${route.tab ?? ""}`;
+
+    if (routeAppliedRef.current === routeKey) {
+      return;
+    }
+
+    const routeTable = tables.find((table) => table.table_schema === route.schema && table.table_name === route.table);
+
+    if (routeTable) {
+      routeAppliedRef.current = routeKey;
+      if (route.tab) setActiveTab(route.tab);
+      void handlePreviewTable(routeTable, { tab: route.tab, updateUrl: false });
+    }
+  }, [activeConnectionId, connectionState, connections, routeRevision, tables]);
+
   function tryAutoConnect(): void {
     if (autoConnectRef.current) {
       return;
@@ -414,6 +562,20 @@ export function App(): React.ReactElement {
   const schemaGroups = useMemo(() => groupTablesBySchema(visibleTables), [visibleTables]);
   const selectedTable = preview.table;
   const activeConnection = connections.find((connection) => connection.id === activeConnectionId) ?? null;
+  function handleActiveTabChange(tab: WorkspaceTab): void {
+    setActiveTab(tab);
+
+    if (activeConnection) {
+      const route = readCatalogRoute() ?? {
+        catalog: activeConnection.name || activeConnection.id,
+        schema: selectedSchema || selectedTable?.table_schema,
+        table: selectedTable?.table_name,
+      };
+
+      writeCatalogRoute({ ...route, tab });
+    }
+  }
+
   const selectedSchemaTables = useMemo(
     () => tables.filter((table) => table.table_schema === selectedSchema),
     [selectedSchema, tables],
@@ -436,7 +598,7 @@ export function App(): React.ReactElement {
     }
   }
 
-  async function establishConnection(profile: ConnectionProfile): Promise<boolean> {
+  async function establishConnection(profile: ConnectionProfile, mode: ConnectionMode = connectionMode): Promise<boolean> {
     clearLockTimer();
     previewRunRef.current += 1;
     void clientRef.current?.close();
@@ -450,7 +612,7 @@ export function App(): React.ReactElement {
 
     let secret: string;
 
-    if (connectionMode === "unlock") {
+    if (mode === "unlock") {
       const secretPassphrase = vaultSecret || passphrase;
 
       if (!secretPassphrase) {
@@ -463,6 +625,7 @@ export function App(): React.ReactElement {
         secret = await unlockEncryptedToken(secretPassphrase, profile.id);
         setVaultSecret(secretPassphrase);
         setVaultState("unlocked");
+        writeTokenVaultSession(profile.id, getVaultTtlMs(vaultTtlMinutes));
         startLockTimer();
       } catch (error) {
         setConnectionState("error");
@@ -515,6 +678,25 @@ export function App(): React.ReactElement {
     await handlePasteTokenCheck(profile);
   }
 
+  async function handleUnlockDialogSubmit(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+
+    const profile = activeConnection;
+
+    if (!profile) {
+      setMessage({ kind: "error", text: "Select a catalog before unlocking the vault." });
+      return;
+    }
+
+    setConnectionMode("unlock");
+    const connected = await establishConnection(profile, "unlock");
+
+    if (connected) {
+      setIsUnlockDialogOpen(false);
+      setIsConnectionDialogOpen(false);
+    }
+  }
+
   function getConnectionDraft(): ConnectionProfile | null {
     const uri = endpoint.trim();
     const name = connectionName.trim() || getConnectionAlias(uri);
@@ -554,6 +736,7 @@ export function App(): React.ReactElement {
       }
 
       await saveEncryptedToken(token.trim(), secret, profile.id);
+      writeTokenVaultSession(profile.id, getVaultTtlMs(vaultTtlMinutes));
       setVaultSecret(secret);
       setSavedTokenExists(true);
       setVaultState("unlocked");
@@ -615,11 +798,13 @@ export function App(): React.ReactElement {
     setVaultState(vaultSecret ? "unlocked" : hasSavedToken ? "locked" : "absent");
     setConnectionMode(hasSavedToken ? "unlock" : "paste");
     setMessage({ kind: "info", text: hasSavedToken ? "Unlock this catalog to browse it." : "Connect to browse this catalog." });
-    setIsConnectionDialogOpen(true);
+    setIsUnlockDialogOpen(hasSavedToken && !vaultSecret);
+    setIsConnectionDialogOpen(!hasSavedToken || Boolean(vaultSecret));
   }
 
   function handleDeleteConnection(connection: ConnectionProfile): void {
     forgetTokenVaultRecord(connection.id);
+    forgetTokenVaultSession(connection.id);
     setConnections((current) => current.filter((candidate) => candidate.id !== connection.id));
 
     if (connection.id === activeConnectionId) {
@@ -636,6 +821,23 @@ export function App(): React.ReactElement {
     }
 
     setMessage({ kind: "success", text: `Deleted ${connection.name}.` });
+  }
+
+  function handleForgetActiveToken(): void {
+    if (!activeConnectionId) {
+      return;
+    }
+
+    forgetTokenVaultRecord(activeConnectionId);
+    forgetTokenVaultSession(activeConnectionId);
+    clearLockTimer();
+    setVaultSecret("");
+    setPassphrase("");
+    setSavedTokenExists(false);
+    setVaultState("absent");
+    setConnectionMode("paste");
+    setIsUnlockDialogOpen(false);
+    setMessage({ kind: "success", text: "Forgot the saved encrypted token for this catalog." });
   }
 
   function handleToggleSidebar(): void {
@@ -684,6 +886,7 @@ export function App(): React.ReactElement {
       setVaultSecret(secretPassphrase);
       setVaultState("unlocked");
       setPassphrase("");
+      writeTokenVaultSession(profile.id, getVaultTtlMs(vaultTtlMinutes));
       startLockTimer();
       await checkConnectionWithSecret(profile, secret);
     } catch (error) {
@@ -717,6 +920,9 @@ export function App(): React.ReactElement {
 
   async function lockToken(options: { keepDialogClosed?: boolean } = {}): Promise<void> {
     clearLockTimer();
+    if (activeConnectionId) {
+      forgetTokenVaultSession(activeConnectionId);
+    }
     setVaultSecret("");
     setPassphrase("");
     const hasSavedToken = activeConnectionId ? hasTokenVaultRecord(activeConnectionId) : false;
@@ -733,7 +939,8 @@ export function App(): React.ReactElement {
     setActiveTab("preview");
     setPreview({ isLoading: false, table: null, result: null });
     setMessage({ kind: "info", text: "Token locked. Enter your passphrase to reconnect." });
-    setIsConnectionDialogOpen(options.keepDialogClosed ? false : hasSavedToken);
+    setIsConnectionDialogOpen(false);
+    setIsUnlockDialogOpen(options.keepDialogClosed ? false : hasSavedToken);
   }
 
   function clearLockTimer(): void {
@@ -745,18 +952,27 @@ export function App(): React.ReactElement {
 
   function startLockTimer(): void {
     clearLockTimer();
+    const ttlMs = getVaultTtlMs(vaultTtlMinutes);
+
+    if (ttlMs === null) {
+      return;
+    }
+
     lockTimerRef.current = window.setTimeout(() => {
       void lockToken();
-    }, TOKEN_IDLE_TIMEOUT_MS);
+    }, ttlMs);
   }
 
   function touchTokenSession(): void {
     if (vaultState === "unlocked") {
+      if (activeConnectionId) {
+        writeTokenVaultSession(activeConnectionId, getVaultTtlMs(vaultTtlMinutes));
+      }
       startLockTimer();
     }
   }
 
-  async function handlePreviewTable(table: RemoteTable): Promise<void> {
+  async function handlePreviewTable(table: RemoteTable, options: { tab?: WorkspaceTab; updateUrl?: boolean } = {}): Promise<void> {
     const client = clientRef.current;
 
     if (!client) {
@@ -765,12 +981,27 @@ export function App(): React.ReactElement {
     }
 
     touchTokenSession();
-    await previewTableWithClient(client, table);
+    if (options.updateUrl !== false && activeConnection) {
+      writeCatalogRoute({
+        catalog: activeConnection.name || activeConnection.id,
+        schema: table.table_schema,
+        tab: options.tab ?? "preview",
+        table: table.table_name,
+      });
+    }
+    await previewTableWithClient(client, table, options.tab);
   }
 
-  function handleSelectSchema(schema: string): void {
+  function handleSelectSchema(schema: string, options: { updateUrl?: boolean } = {}): void {
     touchTokenSession();
     const schemaTableCount = tables.filter((table) => table.table_schema === schema).length;
+
+    if (options.updateUrl !== false && activeConnection) {
+      writeCatalogRoute({
+        catalog: activeConnection.name || activeConnection.id,
+        schema,
+      });
+    }
 
     previewRunRef.current += 1;
     setSelectedSchema(schema);
@@ -783,8 +1014,11 @@ export function App(): React.ReactElement {
     });
   }
 
-  function handleSelectCatalog(): void {
+  function handleSelectCatalog(options: { updateUrl?: boolean } = {}): void {
     touchTokenSession();
+    if (options.updateUrl !== false && activeConnection) {
+      writeCatalogRoute({ catalog: activeConnection.name || activeConnection.id });
+    }
     previewRunRef.current += 1;
     setSelectedSchema("");
     setSelectedTableKey("");
@@ -798,18 +1032,18 @@ export function App(): React.ReactElement {
     });
   }
 
-  async function previewTableWithClient(client: QuackClient, table: RemoteTable): Promise<void> {
+  async function previewTableWithClient(client: QuackClient, table: RemoteTable, tab: WorkspaceTab = "preview"): Promise<void> {
     const runId = previewRunRef.current + 1;
     previewRunRef.current = runId;
     const isDucklake = table.table_type !== "INTERNAL";
     setSelectedSchema("");
     setSelectedTableKey(tableKey(table));
-    setActiveTab("preview");
+    setActiveTab(tab);
     setPreview({ isLoading: true, table, result: null });
     setDucklakeStats([]);
-    setDucklakeStorage(null);
     setDucklakeColumns([]);
     setDucklakeSnapshots([]);
+    setDucklakeMetadata(null);
     setMessage({ kind: "info", text: `Loading ${table.table_schema}.${table.table_name}.` });
 
     try {
@@ -842,21 +1076,21 @@ export function App(): React.ReactElement {
 
     const results = await Promise.allSettled([
       client.getTableStats(table.table_schema, table.table_name),
-      client.getTableStorage(table.table_schema, table.table_name),
       client.getColumnDetails(table.table_schema, table.table_name),
       client.getSnapshotHistory(table.table_schema, table.table_name),
+      client.getDucklakeMetadata(table.table_schema, table.table_name),
     ]);
 
     if (previewRunRef.current !== runId) {
       return;
     }
 
-    const [statsResult, storageResult, columnsResult, snapshotsResult] = results;
+    const [statsResult, columnsResult, snapshotsResult, metadataResult] = results;
 
     if (statsResult.status === "fulfilled") setDucklakeStats(statsResult.value);
-    if (storageResult.status === "fulfilled") setDucklakeStorage(storageResult.value);
     if (columnsResult.status === "fulfilled") setDucklakeColumns(columnsResult.value);
     if (snapshotsResult.status === "fulfilled") setDucklakeSnapshots(snapshotsResult.value);
+    if (metadataResult.status === "fulfilled") setDucklakeMetadata(metadataResult.value);
 
     setDucklakeMetaLoading(false);
   }
@@ -869,6 +1103,18 @@ export function App(): React.ReactElement {
           gridTemplateColumns: sidebarCollapsed ? "48px minmax(0,1fr)" : `${sidebarWidth}px 6px minmax(0,1fr)`,
         }}
       >
+        <UnlockVaultDialog
+          activeConnection={activeConnection}
+          connectionState={connectionState}
+          open={isUnlockDialogOpen}
+          passphrase={passphrase}
+          sessionExpired={activeConnectionId ? isTokenVaultSessionExpired(activeConnectionId) : false}
+          ttlMinutes={vaultTtlMinutes}
+          onOpenChange={setIsUnlockDialogOpen}
+          onPassphraseChange={setPassphrase}
+          onSubmit={handleUnlockDialogSubmit}
+        />
+
         <ConnectionDialog
           connectionMode={connectionMode}
           connectionState={connectionState}
@@ -881,6 +1127,7 @@ export function App(): React.ReactElement {
           passphrase={passphrase}
           rememberToken={rememberToken}
           token={token}
+          vaultTtlMinutes={vaultTtlMinutes}
           vaultState={vaultState}
           vaultSupported={vaultSupported}
           activeConnectionId={activeConnectionId}
@@ -890,6 +1137,8 @@ export function App(): React.ReactElement {
           onOpenChange={setIsConnectionDialogOpen}
           onPassphraseChange={setPassphrase}
           onRememberTokenChange={setRememberToken}
+          onVaultTtlMinutesChange={setVaultTtlMinutes}
+          onForgetToken={handleForgetActiveToken}
           onCheckConnection={() => void handleCheckConnection()}
           onSubmit={handleSaveConnection}
           onTokenChange={setToken}
@@ -916,6 +1165,7 @@ export function App(): React.ReactElement {
           onAddConnection={handleAddConnection}
           onConnectionOpen={() => setIsConnectionDialogOpen(true)}
           onSelectConnection={handleSelectConnection}
+          onSelectCatalog={handleSelectCatalog}
           onLockToken={() => void lockToken()}
           onPreviewTable={handlePreviewTable}
           onSearchChange={setCatalogSearch}
@@ -942,11 +1192,11 @@ export function App(): React.ReactElement {
           selectedSchema={selectedSchema}
           selectedTable={selectedTable}
           ducklakeStats={ducklakeStats}
-          ducklakeStorage={ducklakeStorage}
           ducklakeColumns={ducklakeColumns}
+          ducklakeMetadata={ducklakeMetadata}
           ducklakeMetaLoading={ducklakeMetaLoading}
           ducklakeSnapshots={ducklakeSnapshots}
-          onActiveTabChange={setActiveTab}
+          onActiveTabChange={handleActiveTabChange}
           onPreviewTable={handlePreviewTable}
           onSelectCatalog={handleSelectCatalog}
           onSelectSchema={handleSelectSchema}
@@ -969,6 +1219,7 @@ type ConnectionDialogProps = {
   passphrase: string;
   rememberToken: boolean;
   token: string;
+  vaultTtlMinutes: number;
   vaultState: TokenVaultState;
   vaultSupported: boolean;
   onAddConnection: () => void;
@@ -979,11 +1230,91 @@ type ConnectionDialogProps = {
   onOpenChange: (open: boolean) => void;
   onPassphraseChange: (value: string) => void;
   onRememberTokenChange: (checked: boolean) => void;
+  onForgetToken: () => void;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
   onTokenChange: (value: string) => void;
+  onVaultTtlMinutesChange: (value: number) => void;
   onDeleteConnection: (connection: ConnectionProfile) => void;
   onSelectConnection: (connection: ConnectionProfile) => void;
 };
+
+function UnlockVaultDialog({
+  activeConnection,
+  connectionState,
+  open,
+  passphrase,
+  sessionExpired,
+  ttlMinutes,
+  onOpenChange,
+  onPassphraseChange,
+  onSubmit,
+}: {
+  activeConnection: ConnectionProfile | null;
+  connectionState: ConnectionState;
+  open: boolean;
+  passphrase: string;
+  sessionExpired: boolean;
+  ttlMinutes: number;
+  onOpenChange: (open: boolean) => void;
+  onPassphraseChange: (value: string) => void;
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => Promise<void>;
+}): React.ReactElement {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[min(420px,calc(100vw-2rem))] max-w-none" title="Unlock vault" onOpenChange={onOpenChange}>
+        <form className="grid gap-4 p-4" onSubmit={(event) => void onSubmit(event)}>
+          <div className="flex items-start gap-3">
+            <div className="grid size-9 shrink-0 place-items-center rounded-md bg-accent text-accent-foreground">
+              <LockKeyhole className="size-4.5" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="text-base font-black">Unlock local vault</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {sessionExpired
+                  ? "Your unlock session expired. Enter your passphrase to reconnect."
+                  : "Enter your passphrase to reconnect with the saved encrypted token."}
+              </p>
+            </div>
+          </div>
+
+          {activeConnection ? (
+            <div className="grid gap-1 rounded-md border border-border bg-muted/35 p-3">
+              <div className="truncate text-sm font-bold">{activeConnection.name}</div>
+              <div className="truncate text-xs font-medium text-muted-foreground">{formatEndpoint(activeConnection.endpoint)}</div>
+            </div>
+          ) : null}
+
+          <label className="grid gap-1.5">
+            <span className="text-xs font-semibold uppercase text-muted-foreground">Passphrase</span>
+            <Input
+              autoComplete="current-password"
+              autoFocus
+              placeholder="Unlock saved token"
+              type="password"
+              value={passphrase}
+              onChange={(event) => onPassphraseChange(event.target.value)}
+            />
+          </label>
+
+          <Alert className="flex items-start gap-2" variant="info">
+            <ShieldCheck className="mt-0.5 size-4 shrink-0" />
+            <span>Unlocked tokens stay in this browser tab until {ttlMinutes < 60 ? `${ttlMinutes} minutes` : `${ttlMinutes / 60} hours`} of idle time or refresh.</span>
+          </Alert>
+
+          <div className="flex justify-end gap-2 border-t border-border pt-3">
+            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+            <Button disabled={connectionState === "connecting" || !activeConnection} type="submit">
+              {connectionState === "connecting" ? <Loader2 className="animate-spin" /> : <LockKeyhole />}
+              Unlock and connect
+            </Button>
+          </div>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 function ConnectionDialog({
   activeConnectionId,
@@ -998,6 +1329,7 @@ function ConnectionDialog({
   passphrase,
   rememberToken,
   token,
+  vaultTtlMinutes,
   vaultState,
   vaultSupported,
   onAddConnection,
@@ -1008,8 +1340,10 @@ function ConnectionDialog({
   onOpenChange,
   onPassphraseChange,
   onRememberTokenChange,
+  onForgetToken,
   onSubmit,
   onTokenChange,
+  onVaultTtlMinutesChange,
   onDeleteConnection,
   onSelectConnection,
 }: ConnectionDialogProps): React.ReactElement {
@@ -1124,6 +1458,15 @@ function ConnectionDialog({
                     {vaultState === "unlocked" ? "Unlocked" : hasSavedToken ? "Locked" : "Not set"}
                   </Badge>
                 </div>
+                {hasSavedToken ? (
+                  <div className="flex items-center justify-between gap-3 rounded-md bg-background px-2.5 py-2">
+                    <span className="text-xs font-medium text-muted-foreground">Saved encrypted token on this device</span>
+                    <Button size="sm" type="button" variant="quiet" onClick={onForgetToken}>
+                      <Trash2 />
+                      Forget
+                    </Button>
+                  </div>
+                ) : null}
                 {needsVaultPassphrase ? (
                   <label className="grid gap-1.5">
                     <span className="text-xs font-semibold uppercase text-muted-foreground">Vault passphrase</span>
@@ -1136,6 +1479,27 @@ function ConnectionDialog({
                     />
                   </label>
                 ) : null}
+                <div className="grid gap-1.5">
+                  <span className="text-xs font-semibold uppercase text-muted-foreground">Idle lock</span>
+                  <div className="grid grid-cols-4 gap-1 rounded-md border border-border bg-background p-1">
+                    {VAULT_TTL_OPTIONS.map((minutes) => (
+                      <button
+                        className={cn(
+                          "h-7 rounded-sm text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground",
+                          vaultTtlMinutes === minutes && "bg-muted text-foreground shadow-xs",
+                        )}
+                        key={minutes}
+                        type="button"
+                        onClick={() => onVaultTtlMinutesChange(minutes)}
+                      >
+                        {minutes < 60 ? `${minutes}m` : `${minutes / 60}h`}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="text-xs text-muted-foreground">
+                    After a refresh, unlock still needs your passphrase because the decrypted token is memory-only.
+                  </span>
+                </div>
               </div>
 
               <div className="grid gap-3 sm:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
@@ -1257,6 +1621,7 @@ type CatalogSidebarProps = {
   onLockToken: () => void;
   onPreviewTable: (table: RemoteTable) => Promise<void>;
   onSearchChange: (value: string) => void;
+  onSelectCatalog: () => void;
   onSelectSchema: (schema: string) => void;
   onSelectConnection: (connection: ConnectionProfile) => void;
   onThemeChange: () => void;
@@ -1283,6 +1648,7 @@ function CatalogSidebar({
   onLockToken,
   onPreviewTable,
   onSearchChange,
+  onSelectCatalog,
   onSelectSchema,
   onSelectConnection,
   onThemeChange,
@@ -1389,6 +1755,7 @@ function CatalogSidebar({
             selectedSchema={selectedSchema}
             selectedTableKey={selectedTableKey}
             onPreviewTable={onPreviewTable}
+            onSelectCatalog={onSelectCatalog}
             onSelectConnection={onSelectConnection}
             onSelectSchema={onSelectSchema}
           />
@@ -1401,6 +1768,7 @@ function CatalogSidebar({
             selectedSchema={selectedSchema}
             selectedTableKey={selectedTableKey}
             onPreviewTable={onPreviewTable}
+            onSelectCatalog={onSelectCatalog}
             onSelectConnection={onSelectConnection}
             onSelectSchema={onSelectSchema}
           />
@@ -1472,6 +1840,7 @@ function ConnectionTree({
   selectedSchema,
   selectedTableKey,
   onPreviewTable,
+  onSelectCatalog,
   onSelectConnection,
   onSelectSchema,
 }: {
@@ -1482,6 +1851,7 @@ function ConnectionTree({
   selectedSchema: string;
   selectedTableKey: string;
   onPreviewTable: (table: RemoteTable) => Promise<void>;
+  onSelectCatalog: () => void;
   onSelectConnection: (connection: ConnectionProfile) => void;
   onSelectSchema: (schema: string) => void;
 }): React.ReactElement {
@@ -1498,11 +1868,13 @@ function ConnectionTree({
                 isActive && "bg-sidebar-accent text-sidebar-accent-foreground",
               )}
               onClick={(event) => {
-                if ((event.target as HTMLElement).closest("[data-connection-toggle]")) {
+                event.preventDefault();
+
+                if (isActive) {
+                  onSelectCatalog();
                   return;
                 }
 
-                event.preventDefault();
                 onSelectConnection(connection);
               }}
             >
@@ -1627,8 +1999,8 @@ type PreviewWorkspaceProps = {
   selectedSchema: string;
   selectedTable: RemoteTable | null;
   ducklakeStats: ColumnStat[];
-  ducklakeStorage: TableStorage | null;
   ducklakeColumns: ColumnDetail[];
+  ducklakeMetadata: DucklakeMetadata | null;
   ducklakeMetaLoading: boolean;
   ducklakeSnapshots: SnapshotRow[];
   onActiveTabChange: (tab: WorkspaceTab) => void;
@@ -1646,8 +2018,8 @@ function PreviewWorkspace({
   selectedSchema,
   selectedTable,
   ducklakeStats,
-  ducklakeStorage,
   ducklakeColumns,
+  ducklakeMetadata,
   ducklakeMetaLoading,
   ducklakeSnapshots,
   onActiveTabChange,
@@ -1655,8 +2027,6 @@ function PreviewWorkspace({
   onSelectCatalog,
   onSelectSchema,
 }: PreviewWorkspaceProps): React.ReactElement {
-  const rowCount = preview.result?.rows.length ?? 0;
-  const columnCount = preview.result?.columns.length ?? 0;
   const selectedTableType = selectedTable ? getDisplayTableType(selectedTable) : "";
   const isSchemaView = selectedSchema.length > 0;
   const isCatalogView = Boolean(activeConnection && !selectedSchema && !selectedTable);
@@ -1723,8 +2093,6 @@ function PreviewWorkspace({
             ) : (
               <>
                 {selectedTableType ? <Badge variant="secondary">{selectedTableType}</Badge> : null}
-                <Badge variant="outline">{rowCount} rows</Badge>
-                <Badge variant="outline">{columnCount} columns</Badge>
               </>
             )}
           </div>
@@ -1733,19 +2101,6 @@ function PreviewWorkspace({
 
       {isSchemaView || isCatalogView ? null : (
         <>
-          {isDucklake && ducklakeStorage ? (
-            <div className="flex items-center gap-3 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
-              {ducklakeStorage.has_primary_key ? (
-                <span className="inline-flex items-center gap-1">
-                  <KeyRound className="size-3" />
-                  has PK
-                </span>
-              ) : null}
-              <span>{ducklakeStorage.column_count} columns</span>
-              {ducklakeStorage.row_count > 0 ? <span>{ducklakeStorage.row_count.toLocaleString()} rows</span> : null}
-              <span>{formatBytes(ducklakeStorage.estimated_size)}</span>
-            </div>
-          ) : null}
           <div className="flex gap-1 overflow-x-auto border-b border-border px-2.5">
             {visibleTabs.map((tab) => (
             <button
@@ -1774,6 +2129,7 @@ function PreviewWorkspace({
           <>
             {activeTab === "preview" ? <PreviewPanel preview={preview} /> : null}
             {activeTab === "columns" ? <ColumnsPanel selectedTable={selectedTable} preview={preview} ducklakeColumns={ducklakeColumns} ducklakeStats={ducklakeStats} /> : null}
+            {activeTab === "metadata" ? <MetadataPanel metadata={ducklakeMetadata} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
             {activeTab === "history" ? <HistoryPanel snapshots={ducklakeSnapshots} loading={ducklakeMetaLoading} selectedTable={selectedTable} /> : null}
           </>
         )}
@@ -1916,66 +2272,97 @@ function ColumnsPanel({
   }
 
   const statsByColumn = new Map(ducklakeStats.map((s) => [s.column_name, s]));
-  const hasStats = ducklakeStats.length > 0;
+  const hasDucklakeColumns = ducklakeColumns.length > 0;
+  const fallbackColumns = preview.result?.columnMetadata ?? [];
+  const totalColumns = hasDucklakeColumns ? ducklakeColumns.length : fallbackColumns.length;
+  const nullableCount = hasDucklakeColumns
+    ? ducklakeColumns.filter((column) => column.is_nullable === "YES" || statsByColumn.get(column.column_name)?.contains_null).length
+    : fallbackColumns.filter((column) => column.nullable).length;
+  const typeCount = new Set(
+    hasDucklakeColumns
+      ? ducklakeColumns.map((column) => column.data_type)
+      : fallbackColumns.map((column) => column.type),
+  ).size;
 
-  if (ducklakeColumns.length > 0) {
+  if (hasDucklakeColumns) {
     return (
-      <div className="h-full overflow-auto">
+      <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)]">
+        <div className="grid gap-2 border-b border-border px-3 py-2 sm:grid-cols-4">
+          <MetadataField label="Columns" value={totalColumns} />
+          <MetadataField label="Nullable" value={nullableCount} />
+          <MetadataField label="Types" value={typeCount} />
+          <MetadataField label="With stats" value={ducklakeStats.length} />
+        </div>
+        <div className="min-h-0 overflow-auto">
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-card">
             <TableRow className="hover:bg-transparent">
               <TableHead className="w-12 text-right">#</TableHead>
               <TableHead>Column</TableHead>
-              <TableHead>Type</TableHead>
+              <TableHead className="w-56">Type</TableHead>
               <TableHead className="w-28">Nullable</TableHead>
-              {hasStats ? <TableHead className="w-36">Min</TableHead> : null}
-              {hasStats ? <TableHead className="w-36">Max</TableHead> : null}
-              <TableHead className="w-32">Default</TableHead>
+              <TableHead className="w-36">Min</TableHead>
+              <TableHead className="w-36">Max</TableHead>
+              <TableHead className="w-28 text-right">Nulls</TableHead>
+              <TableHead className="w-40">Default</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {ducklakeColumns.map((column) => {
               const stat = statsByColumn.get(column.column_name);
+              const isNullable = stat?.contains_null ?? (column.is_nullable === "YES");
+
               return (
                 <TableRow key={column.column_name}>
                   <TableCell className="text-right text-xs font-semibold text-muted-foreground">{column.ordinal_position}</TableCell>
                   <TableCell className="font-semibold">{column.column_name}</TableCell>
-                  <TableCell className="text-muted-foreground">{column.data_type}</TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {stat?.contains_null ?? (column.is_nullable === "YES") ? "yes" : "no"}
+                  <TableCell>
+                    <Badge variant="secondary">{formatColumnType(column.data_type, column.character_maximum_length)}</Badge>
                   </TableCell>
-                  {hasStats ? <TableCell className="font-mono text-xs text-muted-foreground" title={stat?.min ?? undefined}>{truncateStat(stat?.min ?? null)}</TableCell> : null}
-                  {hasStats ? <TableCell className="font-mono text-xs text-muted-foreground" title={stat?.max ?? undefined}>{truncateStat(stat?.max ?? null)}</TableCell> : null}
-                  <TableCell className="truncate text-muted-foreground">{column.column_default ?? "\u2014"}</TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {isNullable ? "yes" : "no"}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground" title={stat?.min ?? undefined}>{truncateStat(stat?.min ?? null)}</TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground" title={stat?.max ?? undefined}>{truncateStat(stat?.max ?? null)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatNullPercentage(stat?.null_percentage)}</TableCell>
+                  <TableCell className="max-w-56 truncate text-muted-foreground" title={column.column_default ?? undefined}>{column.column_default ?? "\u2014"}</TableCell>
                 </TableRow>
               );
             })}
           </TableBody>
         </Table>
+        </div>
       </div>
     );
   }
 
-  const columnMetadata = preview.result?.columnMetadata ?? [];
-
   return (
-    <div className="h-full overflow-auto">
-      {columnMetadata.length > 0 ? (
+    <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)]">
+      {fallbackColumns.length > 0 ? (
+        <>
+        <div className="grid gap-2 border-b border-border px-3 py-2 sm:grid-cols-3">
+          <MetadataField label="Columns" value={totalColumns} />
+          <MetadataField label="Nullable" value={nullableCount} />
+          <MetadataField label="Types" value={typeCount} />
+        </div>
+        <div className="min-h-0 overflow-auto">
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-card">
             <TableRow className="hover:bg-transparent">
               <TableHead className="w-12 text-right">#</TableHead>
               <TableHead>Column</TableHead>
-              <TableHead>Type</TableHead>
+              <TableHead className="w-56">Type</TableHead>
               <TableHead className="w-28">Nullable</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {columnMetadata.map((column, index) => (
+            {fallbackColumns.map((column, index) => (
               <TableRow key={column.name}>
                 <TableCell className="text-right text-xs font-semibold text-muted-foreground">{index + 1}</TableCell>
                 <TableCell className="font-semibold">{column.name}</TableCell>
-                <TableCell className="text-muted-foreground">{column.type}</TableCell>
+                <TableCell>
+                  <Badge variant="secondary">{column.type}</Badge>
+                </TableCell>
                 <TableCell className="text-muted-foreground">
                   {column.nullable === null ? "unknown" : column.nullable ? "yes" : "no"}
                 </TableCell>
@@ -1983,9 +2370,305 @@ function ColumnsPanel({
             ))}
           </TableBody>
         </Table>
+        </div>
+        </>
       ) : (
-        <div className="grid h-full place-items-center text-sm text-muted-foreground">Loading columns.</div>
+        <div className="grid h-full place-items-center">
+          <div className="grid w-full max-w-md gap-2 px-6">
+            <Skeleton className="h-8 w-32" />
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-9 w-4/5" />
+          </div>
+        </div>
       )}
+    </div>
+  );
+}
+
+function MetadataPanel({
+  metadata,
+  loading,
+  selectedTable,
+}: {
+  metadata: DucklakeMetadata | null;
+  loading: boolean;
+  selectedTable: RemoteTable | null;
+}): React.ReactElement {
+  const [view, setView] = useState<"overview" | "files" | "snapshots" | "raw">("overview");
+
+  if (loading) {
+    return (
+      <div className="grid h-full place-items-center">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (!selectedTable) {
+    return <EmptyWorkspacePanel icon={Database} title="Select a table" />;
+  }
+
+  const sections = metadata?.sections.filter((section) => section.rows.length > 0) ?? [];
+  const summary = getDucklakeMetadataSummary(metadata);
+
+  if (sections.length === 0) {
+    return <EmptyWorkspacePanel icon={Database} title="No DuckLake metadata available" />;
+  }
+
+  const navItems: Array<{ id: typeof view; label: string; count?: number }> = [
+    { id: "overview", label: "Overview" },
+    { id: "files", label: "Files", count: summary.dataFiles.length + summary.deleteFiles.length },
+    { id: "snapshots", label: "Snapshots", count: summary.snapshots.length },
+    { id: "raw", label: "Raw", count: sections.length },
+  ];
+
+  return (
+    <div className="grid h-full min-h-0 grid-cols-[180px_minmax(0,1fr)] overflow-hidden">
+      <div className="border-r border-border bg-muted/20 p-2">
+        <div className="grid gap-1">
+          {navItems.map((item) => (
+            <button
+              className={cn(
+                "flex h-8 items-center justify-between gap-2 rounded-md px-2 text-left text-sm font-semibold text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+                view === item.id && "bg-sidebar-accent text-sidebar-accent-foreground",
+              )}
+              key={item.id}
+              type="button"
+              onClick={() => setView(item.id)}
+            >
+              <span className="truncate">{item.label}</span>
+              {item.count !== undefined ? <Badge variant="outline">{item.count}</Badge> : null}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="min-h-0 overflow-auto">
+        {view === "overview" ? <MetadataOverview summary={summary} /> : null}
+        {view === "files" ? <MetadataFilesView summary={summary} /> : null}
+        {view === "snapshots" ? <MetadataSnapshotsView summary={summary} /> : null}
+        {view === "raw" ? <MetadataRawView sections={sections} /> : null}
+      </div>
+    </div>
+  );
+}
+
+function MetadataOverview({ summary }: { summary: DucklakeMetadataSummary }): React.ReactElement {
+  const latestSnapshot = summary.snapshots[0];
+
+  return (
+    <div className="grid gap-4 p-3">
+      <div className="grid gap-2 md:grid-cols-4">
+        <MetadataField label="DuckLake table id" value={summary.tableId} />
+        <MetadataField label="Current files" value={summary.currentFileCount} />
+        <MetadataField label="Historical files" value={summary.historicalFileCount} />
+        <MetadataField label="Total size" value={formatBytes(summary.totalFileBytes)} />
+        <MetadataField label="Delete files" value={summary.deleteFiles.length} />
+        <MetadataField label="Snapshots" value={summary.snapshots.length} />
+        <MetadataField label="Partitions" value={summary.partitionColumns.length} />
+        <MetadataField label="Sort keys" value={summary.sortExpressions.length} />
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <MetadataInfoBlock
+          title="Latest snapshot"
+          rows={[
+            ["Snapshot", latestSnapshot?.snapshot_id],
+            ["Time", latestSnapshot?.snapshot_time ? formatMetadataCell("snapshot_time", latestSnapshot.snapshot_time) : undefined],
+            ["Schema version", latestSnapshot?.schema_version],
+          ]}
+        />
+        <MetadataInfoBlock
+          title="Layout"
+          rows={[
+            ["Partition columns", summary.partitionColumns.map(formatPartitionColumn).join(", ")],
+            ["Sort order", summary.sortExpressions.map(formatSortExpression).join(", ")],
+            ["Column tags", summary.columnTags.length],
+          ]}
+        />
+      </div>
+
+      <div className="overflow-hidden rounded-md border border-border">
+        <div className="flex items-center justify-between border-b border-border bg-muted/40 px-3 py-2">
+          <h3 className="text-sm font-bold">Current columns</h3>
+          <Badge variant="outline">{summary.columns.length} columns</Badge>
+        </div>
+        <MetadataRowsTable
+          rows={summary.columns}
+          preferredColumns={["column_order", "column_name", "column_type", "nulls_allowed", "default_value"]}
+          includeRemainingColumns={false}
+        />
+      </div>
+    </div>
+  );
+}
+
+function MetadataFilesView({ summary }: { summary: DucklakeMetadataSummary }): React.ReactElement {
+  return (
+    <div className="grid gap-4 p-3">
+      <div className="grid gap-2 md:grid-cols-4">
+        <MetadataField label="Active data files" value={summary.currentFileCount} />
+        <MetadataField label="Historical data files" value={summary.historicalFileCount} />
+        <MetadataField label="Delete files" value={summary.deleteFiles.length} />
+        <MetadataField label="Total bytes" value={formatBytes(summary.totalFileBytes)} />
+      </div>
+
+      <MetadataSectionTable
+        title="Data files"
+        rows={summary.dataFiles}
+        preferredColumns={["data_file_id", "begin_snapshot", "end_snapshot", "record_count", "file_size_bytes", "partition_id", "path"]}
+      />
+      <MetadataSectionTable
+        title="Delete files"
+        rows={summary.deleteFiles}
+        preferredColumns={["delete_file_id", "begin_snapshot", "end_snapshot", "data_file_id", "delete_count", "file_size_bytes", "path"]}
+      />
+      <MetadataSectionTable
+        title="Partition values"
+        rows={summary.partitionValues}
+        preferredColumns={["data_file_id", "partition_key_index", "partition_value"]}
+      />
+    </div>
+  );
+}
+
+function MetadataSnapshotsView({ summary }: { summary: DucklakeMetadataSummary }): React.ReactElement {
+  return (
+    <div className="grid gap-4 p-3">
+      <MetadataSectionTable
+        title="Snapshots"
+        rows={summary.snapshots}
+        preferredColumns={["snapshot_id", "snapshot_time", "schema_version", "next_file_id"]}
+      />
+      <MetadataSectionTable
+        title="Snapshot changes"
+        rows={summary.snapshotChanges}
+        preferredColumns={["snapshot_id", "changes_made", "author", "commit_message"]}
+      />
+      <MetadataSectionTable
+        title="Schema versions"
+        rows={summary.schemaVersions}
+        preferredColumns={["begin_snapshot", "schema_version", "table_id"]}
+      />
+    </div>
+  );
+}
+
+function MetadataRawView({ sections }: { sections: DucklakeMetadata["sections"] }): React.ReactElement {
+  return (
+    <div className="grid gap-3 p-3">
+      {sections.map((section) => (
+        <details className="overflow-hidden rounded-md border border-border" key={section.id}>
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 bg-muted/40 px-3 py-2">
+            <span className="text-sm font-bold">{section.label}</span>
+            <Badge variant="outline">{section.rows.length} rows</Badge>
+          </summary>
+          <MetadataRowsTable rows={section.rows} />
+        </details>
+      ))}
+    </div>
+  );
+}
+
+function MetadataSectionTable({
+  title,
+  rows,
+  preferredColumns,
+}: {
+  title: string;
+  rows: PreviewRow[];
+  preferredColumns: string[];
+}): React.ReactElement {
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <div className="flex items-center justify-between border-b border-border bg-muted/40 px-3 py-2">
+        <h3 className="text-sm font-bold">{title}</h3>
+        <Badge variant="outline">{rows.length} rows</Badge>
+      </div>
+      {rows.length > 0 ? (
+        <MetadataRowsTable rows={rows} preferredColumns={preferredColumns} includeRemainingColumns={false} />
+      ) : (
+        <div className="p-3 text-sm text-muted-foreground">No rows</div>
+      )}
+    </div>
+  );
+}
+
+function MetadataInfoBlock({ title, rows }: { title: string; rows: Array<[string, unknown]> }): React.ReactElement {
+  return (
+    <div className="rounded-md border border-border bg-muted/20 p-3">
+      <h3 className="text-sm font-bold">{title}</h3>
+      <dl className="mt-3 grid gap-2">
+        {rows.map(([label, value]) => (
+          <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-3 text-sm" key={label}>
+            <dt className="text-muted-foreground">{label}</dt>
+            <dd className="truncate font-semibold">{formatMetadataValue(value)}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+function MetadataField({ label, value }: { label: string; value: unknown }): React.ReactElement {
+  return (
+    <div className="rounded-md border border-border bg-muted/25 p-3">
+      <div className="text-[11px] font-semibold uppercase text-muted-foreground">{label}</div>
+      <div className="mt-1 truncate text-sm font-bold">{formatMetadataValue(value)}</div>
+    </div>
+  );
+}
+
+function MetadataRowsTable({
+  rows,
+  preferredColumns,
+  includeRemainingColumns = true,
+}: {
+  rows: PreviewRow[];
+  preferredColumns?: string[];
+  includeRemainingColumns?: boolean;
+}): React.ReactElement {
+  const rowColumns = Object.keys(rows[0] ?? {});
+  const columns = preferredColumns
+    ? [
+      ...preferredColumns.filter((column) => rowColumns.includes(column)),
+      ...(includeRemainingColumns ? rowColumns.filter((column) => !preferredColumns.includes(column)) : []),
+    ]
+    : rowColumns;
+
+  if (columns.length === 0) {
+    return <div className="p-3 text-sm text-muted-foreground">No columns</div>;
+  }
+
+  return (
+    <div className="max-h-80 overflow-auto">
+      <Table>
+        <TableHeader className="sticky top-0 z-10 bg-card">
+          <TableRow className="hover:bg-transparent">
+            <TableHead className="w-12 text-right">#</TableHead>
+            {columns.map((column) => (
+              <TableHead className="whitespace-nowrap" key={column}>{column}</TableHead>
+            ))}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((row, index) => (
+            <TableRow key={metadataRowKey(row, index)}>
+              <TableCell className="text-right text-xs font-semibold text-muted-foreground">{index + 1}</TableCell>
+              {columns.map((column) => {
+                const value = formatMetadataCell(column, row[column]);
+
+                return (
+                  <TableCell className="max-w-80 truncate font-mono text-xs text-muted-foreground" key={column} title={value}>
+                    {value}
+                  </TableCell>
+                );
+              })}
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -2215,6 +2898,90 @@ function removeBootstrapConnectionParams(): void {
   window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
+function readCatalogRoute(): CatalogRoute | null {
+  const segments = getRouteSegments();
+
+  if (segments[0] !== "catalogs" || !segments[1]) {
+    return null;
+  }
+
+  const route: CatalogRoute = {
+    catalog: segments[1],
+  };
+  const tab = parseWorkspaceTab(new URLSearchParams(window.location.search).get("tab"));
+
+  if (tab) {
+    route.tab = tab;
+  }
+
+  if (segments[2] === "schema" && segments[3]) {
+    route.schema = segments[3];
+  }
+
+  if (segments[4] === "table" && segments[5]) {
+    route.table = segments[5];
+  }
+
+  return route;
+}
+
+function writeCatalogRoute(route: CatalogRoute): void {
+  const segments = ["catalogs", route.catalog];
+
+  if (route.schema) {
+    segments.push("schema", route.schema);
+  }
+
+  if (route.schema && route.table) {
+    segments.push("table", route.table);
+  }
+
+  const base = getRouteBasePath();
+  const path = `${base}${segments.map(encodeURIComponent).join("/")}`;
+  const params = new URLSearchParams(window.location.search);
+
+  if (route.tab) {
+    params.set("tab", route.tab);
+  } else {
+    params.delete("tab");
+  }
+
+  const query = params.toString();
+  const nextUrl = `${path}${query ? `?${query}` : ""}${window.location.hash}`;
+
+  if (`${window.location.pathname}${window.location.search}${window.location.hash}` !== nextUrl) {
+    window.history.pushState({}, "", nextUrl);
+  }
+}
+
+function findConnectionForRoute(connections: ConnectionProfile[], catalog: string): ConnectionProfile | null {
+  return connections.find((connection) => connection.id === catalog || connection.name === catalog) ?? null;
+}
+
+function getRouteSegments(): string[] {
+  const base = getRouteBasePath();
+  const pathname = window.location.pathname.startsWith(base)
+    ? window.location.pathname.slice(base.length)
+    : window.location.pathname.replace(/^\//, "");
+
+  return pathname
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    });
+}
+
+function getRouteBasePath(): string {
+  const base = import.meta.env.BASE_URL || "/";
+
+  return base.endsWith("/") ? base : `${base}/`;
+}
+
 function mergeRuntimeCatalogs(
   storedConnections: ConnectionProfile[],
   runtimeCatalogs: RuntimeCatalog[],
@@ -2289,6 +3056,24 @@ function writeStoredConnections(connections: ConnectionProfile[]): void {
 
 function readStoredActiveConnectionId(): string {
   return readStoredString(ACTIVE_CONNECTION_KEY, "");
+}
+
+function readStoredVaultTtlMinutes(): number {
+  const stored = Number(readStoredString(VAULT_TTL_KEY, String(DEFAULT_VAULT_TTL_MINUTES)));
+
+  return VAULT_TTL_OPTIONS.includes(stored) ? stored : DEFAULT_VAULT_TTL_MINUTES;
+}
+
+function parseWorkspaceTab(value: string | null): WorkspaceTab | null {
+  if (value === "preview" || value === "columns" || value === "metadata" || value === "history") {
+    return value;
+  }
+
+  return null;
+}
+
+function getVaultTtlMs(minutes: number): number {
+  return minutes * 60 * 1000;
 }
 
 function isConnectionProfile(value: unknown): value is ConnectionProfile {
@@ -2463,7 +3248,148 @@ function formatBytes(bytes: number): string {
   return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+function getDucklakeMetadataSummary(metadata: DucklakeMetadata | null): DucklakeMetadataSummary {
+  const sectionRows = (id: string): PreviewRow[] => metadata?.sections.find((section) => section.id === id)?.rows ?? [];
+  const dataFiles = sectionRows("data-files");
+  const deleteFiles = sectionRows("delete-files");
+  const currentFileCount = dataFiles.filter((row) => row.end_snapshot === null || row.end_snapshot === undefined).length;
+
+  return {
+    columnTags: sectionRows("column-tags"),
+    columns: sectionRows("columns"),
+    currentFileCount,
+    dataFiles,
+    deleteFiles,
+    historicalFileCount: dataFiles.length - currentFileCount,
+    partitionColumns: sectionRows("partition-columns"),
+    partitionValues: sectionRows("partition-values"),
+    schemaVersions: sectionRows("schema-versions"),
+    snapshotChanges: sectionRows("snapshot-changes"),
+    snapshots: sectionRows("snapshots"),
+    sortExpressions: sectionRows("sort-expressions"),
+    tableId: metadata?.table_id ?? null,
+    totalFileBytes: dataFiles.reduce((sum, row) => sum + numericMetadataValue(row.file_size_bytes), 0),
+  };
+}
+
+function formatMetadataCell(column: string, value: unknown): string {
+  if (column.includes("size_bytes") || column === "footer_size") {
+    return formatBytes(numericMetadataValue(value));
+  }
+
+  if (column.includes("time") && (typeof value === "string" || typeof value === "number" || typeof value === "bigint")) {
+    return formatTimestamp(value);
+  }
+
+  if (column === "path" && typeof value === "string") {
+    return formatFilePath(value);
+  }
+
+  return stringifyCell(value);
+}
+
+function formatTimestamp(value: string | number | bigint): string {
+  const numericValue = typeof value === "bigint" ? Number(value) : Number(value);
+  const dateInput = Number.isFinite(numericValue) && numericValue > 1_000_000_000_000
+    ? numericValue
+    : String(value);
+  const date = new Date(dateInput);
+
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function formatFilePath(value: string): string {
+  const parts = value.split("/");
+
+  if (parts.length <= 1) {
+    return value;
+  }
+
+  return `${parts.at(-1)} (${parts.slice(0, -1).join("/")})`;
+}
+
+function formatPartitionColumn(row: PreviewRow): string {
+  const column = row.column_id ?? "column";
+  const transform = row.transform ? ` ${row.transform}` : "";
+
+  return `${column}${transform}`;
+}
+
+function formatSortExpression(row: PreviewRow): string {
+  const expression = row.expression ?? "expression";
+  const direction = row.sort_direction ?? "";
+  const nullOrder = row.null_order ?? "";
+
+  return [expression, direction, nullOrder].filter(Boolean).join(" ");
+}
+
+function numericMetadataValue(value: unknown): number {
+  if (typeof value === "number") {
+    return value;
+  }
+
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  return 0;
+}
+
+function formatMetadataValue(value: unknown): string {
+  if (value === null || value === undefined || value === "") {
+    return "\u2014";
+  }
+
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? value.toLocaleString() : value.toString();
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (typeof value === "boolean") {
+    return value ? "yes" : "no";
+  }
+
+  return String(value);
+}
+
+function metadataRowKey(row: PreviewRow, index: number): string {
+  const id = row.id
+    ?? row.table_id
+    ?? row.column_id
+    ?? row.data_file_id
+    ?? row.delete_file_id
+    ?? row.snapshot_id
+    ?? row.partition_id
+    ?? row.sort_id;
+
+  return `${id ?? "row"}-${index}`;
+}
+
 function truncateStat(value: string | null): string {
   if (value === null) return "\u2014";
   return value.length > 24 ? `${value.slice(0, 24)}\u2026` : value;
+}
+
+function formatColumnType(type: string, maxLength: number | null): string {
+  if (maxLength === null || maxLength <= 0) {
+    return type;
+  }
+
+  return `${type}(${maxLength})`;
+}
+
+function formatNullPercentage(value: number | null | undefined): string {
+  if (value === null || value === undefined) {
+    return "\u2014";
+  }
+
+  return `${value.toFixed(value < 1 ? 2 : 1)}%`;
 }

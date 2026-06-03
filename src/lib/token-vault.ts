@@ -8,7 +8,15 @@ export type TokenVaultRecord = {
   updatedAt: string;
 };
 
+export type TokenVaultSession = {
+  version: 1;
+  vaultId: string;
+  lastUnlockedAt: string;
+  expiresAt: string | null;
+};
+
 const TOKEN_VAULT_KEY = "quackalog.encrypted-token.v1";
+const TOKEN_VAULT_SESSION_KEY = "quackalog.vault-session.v1";
 const TOKEN_VAULT_ITERATIONS = 310_000;
 
 export function isTokenVaultSupported(): boolean {
@@ -58,9 +66,67 @@ export function hasTokenVaultRecord(vaultId = "default"): boolean {
 export function forgetTokenVaultRecord(vaultId = "default"): void {
   try {
     window.localStorage.removeItem(getTokenVaultKey(vaultId));
+    forgetTokenVaultSession(vaultId);
   } catch {
     // Local storage can be unavailable in privacy-restricted contexts.
   }
+}
+
+export function readTokenVaultSession(vaultId = "default"): TokenVaultSession | null {
+  try {
+    const raw = window.localStorage.getItem(getTokenVaultSessionKey(vaultId));
+
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<TokenVaultSession>;
+
+    if (
+      parsed.version !== 1 ||
+      typeof parsed.vaultId !== "string" ||
+      typeof parsed.lastUnlockedAt !== "string" ||
+      (typeof parsed.expiresAt !== "string" && parsed.expiresAt !== null)
+    ) {
+      return null;
+    }
+
+    return parsed as TokenVaultSession;
+  } catch {
+    return null;
+  }
+}
+
+export function writeTokenVaultSession(vaultId = "default", ttlMs: number | null): TokenVaultSession {
+  const now = Date.now();
+  const session: TokenVaultSession = {
+    version: 1,
+    vaultId,
+    lastUnlockedAt: new Date(now).toISOString(),
+    expiresAt: ttlMs === null ? null : new Date(now + ttlMs).toISOString(),
+  };
+
+  window.localStorage.setItem(getTokenVaultSessionKey(vaultId), JSON.stringify(session));
+
+  return session;
+}
+
+export function forgetTokenVaultSession(vaultId = "default"): void {
+  try {
+    window.localStorage.removeItem(getTokenVaultSessionKey(vaultId));
+  } catch {
+    // Local storage can be unavailable in privacy-restricted contexts.
+  }
+}
+
+export function isTokenVaultSessionExpired(vaultId = "default"): boolean {
+  const session = readTokenVaultSession(vaultId);
+
+  if (!session || session.expiresAt === null) {
+    return false;
+  }
+
+  return Date.parse(session.expiresAt) <= Date.now();
 }
 
 export async function saveEncryptedToken(token: string, passphrase: string, vaultId = "default"): Promise<TokenVaultRecord> {
@@ -177,4 +243,12 @@ function getTokenVaultKey(vaultId: string): string {
   }
 
   return `${TOKEN_VAULT_KEY}.${encodeURIComponent(vaultId)}`;
+}
+
+function getTokenVaultSessionKey(vaultId: string): string {
+  if (vaultId === "default") {
+    return TOKEN_VAULT_SESSION_KEY;
+  }
+
+  return `${TOKEN_VAULT_SESSION_KEY}.${encodeURIComponent(vaultId)}`;
 }
