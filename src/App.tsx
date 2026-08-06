@@ -80,6 +80,7 @@ type ConnectionMode = "paste" | "unlock";
 type MessageKind = "info" | "success" | "warning" | "error";
 type ThemeMode = "light" | "dark" | "system";
 type WorkspaceTab = "preview" | "schema" | "files" | "snapshots" | "layout" | "raw";
+type MetadataRequestKind = "schema" | "snapshots" | "full";
 
 type PreviewState = {
   isLoading: boolean;
@@ -153,6 +154,9 @@ const WORKSPACE_TABS: Array<{ id: WorkspaceTab; label: string; Icon: typeof Tabl
 export function App(): React.ReactElement {
   const clientRef = useRef<QuackClient | null>(null);
   const previewRunRef = useRef(0);
+  const metadataLoadedRef = useRef(new Set<string>());
+  const metadataInFlightRef = useRef(new Map<string, number>());
+  const metadataRequestIdRef = useRef(0);
   const lockTimerRef = useRef<number | null>(null);
   const autoConnectRef = useRef(false);
   const bootstrappedConnectionRef = useRef(false);
@@ -286,25 +290,28 @@ export function App(): React.ReactElement {
         : null;
       const activeStillExists = next.some((connection) => connection.id === activeConnectionId);
       const nextActive = activeFromConfig ?? (activeStillExists ? next.find((connection) => connection.id === activeConnectionId) : null) ?? next[0];
+      const nextActiveHasSavedToken = nextActive ? hasTokenVaultRecord(nextActive.id) : false;
 
       setConnections(next);
       writeStoredConnections(next);
       setIsCreatingConnection(false);
-      setIsConnectionDialogOpen(false);
+      setIsConnectionDialogOpen(Boolean(nextActive && !DEV_TOKEN && !nextActiveHasSavedToken));
 
       if (nextActive) {
         writeStoredString(ACTIVE_CONNECTION_KEY, nextActive.id);
         setActiveConnectionId(nextActive.id);
         setConnectionName(nextActive.name);
         setEndpoint(nextActive.endpoint);
-        setSavedTokenExists(hasTokenVaultRecord(nextActive.id));
-        setConnectionMode(hasTokenVaultRecord(nextActive.id) ? "unlock" : "paste");
-        setVaultState(hasTokenVaultRecord(nextActive.id) ? "locked" : "absent");
+        setSavedTokenExists(nextActiveHasSavedToken);
+        setConnectionMode(nextActiveHasSavedToken ? "unlock" : "paste");
+        setVaultState(nextActiveHasSavedToken ? "locked" : "absent");
       }
 
       setMessage({
         kind: "info",
-        text: `Loaded ${config.catalogs.length} ${config.catalogs.length === 1 ? "catalog" : "catalogs"} from local config.`,
+        text: nextActiveHasSavedToken
+          ? `Loaded ${config.catalogs.length} ${config.catalogs.length === 1 ? "catalog" : "catalogs"}. Unlock the saved token to connect.`
+          : `Loaded ${config.catalogs.length} ${config.catalogs.length === 1 ? "catalog" : "catalogs"}. Add a token to connect.`,
       });
       tryAutoConnect();
     });
@@ -401,7 +408,7 @@ export function App(): React.ReactElement {
     return () => {
       window.clearTimeout(warmTimer);
       clearLockTimer();
-      void clientRef.current?.close();
+      void closeClient();
     };
   }, []);
 
@@ -467,7 +474,7 @@ export function App(): React.ReactElement {
 
     if (matchedConnection.id !== activeConnectionId) {
       setIsCreatingConnection(false);
-      closeActiveClientForSwitch();
+      void closeActiveClientForSwitch();
       setActiveConnectionId(matchedConnection.id);
       setConnectionName(matchedConnection.name);
       setEndpoint(matchedConnection.endpoint);
@@ -534,8 +541,11 @@ export function App(): React.ReactElement {
     setConnectionState("connecting");
     setMessage({ kind: "info", text: `Connecting to ${profile.name}.` });
 
+    let autoClient: QuackClient | null = null;
+
     QuackClient.create(profile.endpoint, DEV_TOKEN)
       .then((client) => {
+        autoClient = client;
         clientRef.current = client;
         return client.listTables();
       })
@@ -545,7 +555,10 @@ export function App(): React.ReactElement {
         setMessage({ kind: "success", text: `Connected to ${profile.name}.` });
       })
       .catch((error: unknown) => {
-        clientRef.current = null;
+        if (clientRef.current === autoClient) {
+          clientRef.current = null;
+        }
+        void autoClient?.close();
         setConnectionState("idle");
         setMessage({ kind: "error", text: formatError(error) });
       });
@@ -567,6 +580,7 @@ export function App(): React.ReactElement {
   const selectedTable = preview.table;
   const activeConnection = connections.find((connection) => connection.id === activeConnectionId) ?? null;
   function handleActiveTabChange(tab: WorkspaceTab): void {
+    const table = selectedTable;
     setActiveTab(tab);
 
     if (activeConnection) {
@@ -577,6 +591,10 @@ export function App(): React.ReactElement {
       };
 
       writeCatalogRoute({ ...route, tab });
+    }
+
+    if (table && clientRef.current) {
+      void loadMetadataForTab(clientRef.current, table, tab, previewRunRef.current);
     }
   }
 
@@ -605,8 +623,7 @@ export function App(): React.ReactElement {
   async function establishConnection(profile: ConnectionProfile, mode: ConnectionMode = connectionMode): Promise<boolean> {
     clearLockTimer();
     previewRunRef.current += 1;
-    void clientRef.current?.close();
-    clientRef.current = null;
+    await closeClient();
     setConnectionState("connecting");
     setTables([]);
     setSelectedSchema("");
@@ -646,8 +663,10 @@ export function App(): React.ReactElement {
       }
     }
 
+    let client: QuackClient | null = null;
+
     try {
-      const client = await QuackClient.create(profile.endpoint, secret);
+      client = await QuackClient.create(profile.endpoint, secret);
       clientRef.current = client;
       const remoteTables = await client.listTables();
       setConnectionState("ready");
@@ -660,7 +679,10 @@ export function App(): React.ReactElement {
       setToken("");
       return true;
     } catch (error) {
-      clientRef.current = null;
+      if (clientRef.current === client) {
+        clientRef.current = null;
+      }
+      await client?.close();
       setConnectionState("error");
       setMessage({ kind: "error", text: formatError(error) });
       return false;
@@ -768,7 +790,7 @@ export function App(): React.ReactElement {
   }
 
   function handleAddConnection(): void {
-    closeActiveClientForSwitch();
+    void closeActiveClientForSwitch();
     setIsCreatingConnection(true);
     setActiveConnectionId("");
     setConnectionName("");
@@ -790,7 +812,7 @@ export function App(): React.ReactElement {
     }
 
     setIsCreatingConnection(false);
-    closeActiveClientForSwitch();
+    void closeActiveClientForSwitch();
     setActiveConnectionId(connection.id);
     setConnectionName(connection.name);
     setEndpoint(connection.endpoint);
@@ -812,7 +834,7 @@ export function App(): React.ReactElement {
     setConnections((current) => current.filter((candidate) => candidate.id !== connection.id));
 
     if (connection.id === activeConnectionId) {
-      closeActiveClientForSwitch();
+      void closeActiveClientForSwitch();
       setActiveConnectionId("");
       setConnectionName("");
       setEndpoint("");
@@ -852,11 +874,16 @@ export function App(): React.ReactElement {
     });
   }
 
-  function closeActiveClientForSwitch(): void {
+  async function closeClient(): Promise<void> {
+    const client = clientRef.current;
+    clientRef.current = null;
+    await client?.close();
+  }
+
+  async function closeActiveClientForSwitch(): Promise<void> {
     clearLockTimer();
     previewRunRef.current += 1;
-    void clientRef.current?.close();
-    clientRef.current = null;
+    await closeClient();
     setConnectionState("idle");
     setTables([]);
     setSelectedSchema("");
@@ -931,8 +958,7 @@ export function App(): React.ReactElement {
     setPassphrase("");
     const hasSavedToken = activeConnectionId ? hasTokenVaultRecord(activeConnectionId) : false;
     previewRunRef.current += 1;
-    await clientRef.current?.close();
-    clientRef.current = null;
+    await closeClient();
     setConnectionState("idle");
     setSavedTokenExists(hasSavedToken);
     setVaultState(hasSavedToken ? "locked" : "absent");
@@ -1044,6 +1070,8 @@ export function App(): React.ReactElement {
     setSelectedTableKey(tableKey(table));
     setActiveTab(tab);
     setPreview({ isLoading: true, table, result: null });
+    metadataLoadedRef.current.clear();
+    metadataInFlightRef.current.clear();
     setDucklakeStats([]);
     setDucklakeColumns([]);
     setDucklakeSnapshots([]);
@@ -1051,7 +1079,7 @@ export function App(): React.ReactElement {
     setMessage({ kind: "info", text: `Loading ${table.table_schema}.${table.table_name}.` });
 
     try {
-      const result = await client.previewTable(table.table_schema, table.table_name);
+      const result = await client.previewTable(table.table_schema, table.table_name, table.table_database);
 
       if (previewRunRef.current !== runId) {
         return;
@@ -1072,31 +1100,83 @@ export function App(): React.ReactElement {
       return;
     }
 
-    if (!isDucklake) {
+    if (isDucklake) {
+      void loadMetadataForTab(client, table, tab, runId);
+    }
+  }
+
+  async function loadMetadataForTab(
+    client: QuackClient,
+    table: RemoteTable,
+    tab: WorkspaceTab,
+    runId: number,
+  ): Promise<void> {
+    if (table.table_type === "INTERNAL") {
       return;
     }
 
+    const kind = metadataRequestKind(tab);
+
+    if (!kind) {
+      return;
+    }
+
+    const requestKey = `${tableKey(table)}:${kind}`;
+
+    if (metadataLoadedRef.current.has(requestKey) || metadataInFlightRef.current.has(requestKey)) {
+      return;
+    }
+
+    const requestId = ++metadataRequestIdRef.current;
+    metadataInFlightRef.current.set(requestKey, requestId);
     setDucklakeMetaLoading(true);
 
-    const results = await Promise.allSettled([
-      client.getTableStats(table.table_schema, table.table_name),
-      client.getColumnDetails(table.table_schema, table.table_name),
-      client.getSnapshotHistory(table.table_schema, table.table_name),
-      client.getDucklakeMetadata(table.table_schema, table.table_name),
-    ]);
+    try {
+      if (kind === "schema") {
+        const [statsResult, columnsResult] = await Promise.allSettled([
+          client.getTableStats(table.table_schema, table.table_name, table.table_database),
+          client.getColumnDetails(table.table_schema, table.table_name, table.table_database),
+        ]);
 
-    if (previewRunRef.current !== runId) {
-      return;
+        if (previewRunRef.current === runId) {
+          if (statsResult.status === "fulfilled") setDucklakeStats(statsResult.value);
+          if (columnsResult.status === "fulfilled") setDucklakeColumns(columnsResult.value);
+        }
+      } else if (kind === "snapshots") {
+        const snapshotsResult = await Promise.allSettled([
+          client.getSnapshotHistory(table.table_schema, table.table_name, table.table_database),
+        ]);
+
+        if (previewRunRef.current === runId && snapshotsResult[0].status === "fulfilled") {
+          setDucklakeSnapshots(snapshotsResult[0].value);
+        }
+      } else {
+        const metadataResult = await client.getDucklakeMetadata(
+          table.table_schema,
+          table.table_name,
+          table.table_database,
+        );
+
+        if (previewRunRef.current === runId) {
+          setDucklakeMetadata(metadataResult);
+        }
+      }
+
+      if (previewRunRef.current === runId) {
+        metadataLoadedRef.current.add(requestKey);
+      }
+    } catch (error) {
+      if (previewRunRef.current === runId) {
+        setMessage({ kind: "error", text: formatError(error) });
+      }
+    } finally {
+      if (metadataInFlightRef.current.get(requestKey) === requestId) {
+        metadataInFlightRef.current.delete(requestKey);
+      }
+      if (previewRunRef.current === runId) {
+        setDucklakeMetaLoading(Array.from(metadataInFlightRef.current.keys()).some((key) => key.startsWith(`${tableKey(table)}:`)));
+      }
     }
-
-    const [statsResult, columnsResult, snapshotsResult, metadataResult] = results;
-
-    if (statsResult.status === "fulfilled") setDucklakeStats(statsResult.value);
-    if (columnsResult.status === "fulfilled") setDucklakeColumns(columnsResult.value);
-    if (snapshotsResult.status === "fulfilled") setDucklakeSnapshots(snapshotsResult.value);
-    if (metadataResult.status === "fulfilled") setDucklakeMetadata(metadataResult.value);
-
-    setDucklakeMetaLoading(false);
   }
 
   return (
@@ -1200,7 +1280,9 @@ export function App(): React.ReactElement {
           ducklakeMetadata={ducklakeMetadata}
           ducklakeMetaLoading={ducklakeMetaLoading}
           ducklakeSnapshots={ducklakeSnapshots}
+          isConnected={connectionState === "ready"}
           onActiveTabChange={handleActiveTabChange}
+          onConnectionOpen={() => setIsConnectionDialogOpen(true)}
           onPreviewTable={handlePreviewTable}
           onSelectCatalog={handleSelectCatalog}
           onSelectSchema={handleSelectSchema}
@@ -1359,7 +1441,7 @@ function ConnectionDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[min(900px,calc(100vw-2rem))] max-w-none" title="Connection" onOpenChange={onOpenChange}>
+      <DialogContent className="flex h-[min(640px,calc(100vh-2rem))] w-[min(900px,calc(100vw-2rem))] max-w-none flex-col overflow-hidden" title="Connection" onOpenChange={onOpenChange}>
         <div className="border-b border-border px-4 py-3 pr-12">
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-black">Catalog connections</h2>
@@ -1369,7 +1451,7 @@ function ConnectionDialog({
           </div>
         </div>
 
-        <form className="grid min-h-[520px] sm:grid-cols-[240px_minmax(0,1fr)]" onSubmit={(event) => void onSubmit(event)}>
+        <form className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] sm:grid-rows-none sm:grid-cols-[240px_minmax(0,1fr)]" onSubmit={(event) => void onSubmit(event)}>
           <div className="flex min-h-0 flex-col border-b border-border bg-muted/35 p-3 sm:border-b-0 sm:border-r">
             <div className="mb-2 flex items-center justify-between gap-2">
               <span className="text-xs font-semibold uppercase text-muted-foreground">Saved catalogs</span>
@@ -1421,9 +1503,10 @@ function ConnectionDialog({
           </div>
 
           <div className="flex min-h-0 flex-col">
-            <div className="grid gap-3 p-4">
-              {hasSavedToken ? (
-                <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-muted p-1">
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <div className="grid gap-3 p-4">
+                {hasSavedToken ? (
+                  <div className="grid grid-cols-2 gap-1 rounded-md border border-border bg-muted p-1">
                   <button
                     className={cn(
                       "h-8 rounded-sm text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground",
@@ -1444,8 +1527,8 @@ function ConnectionDialog({
                   >
                     Use token
                   </button>
-                </div>
-              ) : null}
+                  </div>
+                ) : null}
 
               <div className="grid gap-2 rounded-md border border-border bg-muted/45 p-3">
                 <div className="flex items-center justify-between gap-3">
@@ -1584,19 +1667,20 @@ function ConnectionDialog({
               {message.text ? (
                 <Alert variant={message.kind}>{message.text}</Alert>
               ) : null}
+              </div>
             </div>
 
-            <div className="mt-auto flex flex-wrap items-center justify-end gap-2 border-t border-border p-4">
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              Cancel
-            </Button>
-            <Button disabled={connectionState === "connecting"} type="button" variant="outline" onClick={onCheckConnection}>
-              {connectionState === "connecting" ? <Loader2 className="animate-spin" /> : <Database />}
-              Check connection
-            </Button>
-            <Button disabled={connectionState === "connecting"} type="submit">
-              Save
-            </Button>
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border bg-popover p-4">
+              <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+                Cancel
+              </Button>
+              <Button disabled={connectionState === "connecting"} type="button" variant="outline" onClick={onCheckConnection}>
+                {connectionState === "connecting" ? <Loader2 className="animate-spin" /> : <Database />}
+                Check connection
+              </Button>
+              <Button disabled={connectionState === "connecting"} type="submit">
+                Save
+              </Button>
             </div>
           </div>
         </form>
@@ -1998,6 +2082,7 @@ type PreviewWorkspaceProps = {
   activeTab: WorkspaceTab;
   activeConnection: ConnectionProfile | null;
   catalogTables: RemoteTable[];
+  isConnected: boolean;
   preview: PreviewState;
   schemaTables: RemoteTable[];
   selectedSchema: string;
@@ -2008,6 +2093,7 @@ type PreviewWorkspaceProps = {
   ducklakeMetaLoading: boolean;
   ducklakeSnapshots: SnapshotRow[];
   onActiveTabChange: (tab: WorkspaceTab) => void;
+  onConnectionOpen: () => void;
   onPreviewTable: (table: RemoteTable) => Promise<void>;
   onSelectCatalog: () => void;
   onSelectSchema: (schema: string) => void;
@@ -2017,6 +2103,7 @@ function PreviewWorkspace({
   activeTab,
   activeConnection,
   catalogTables,
+  isConnected,
   preview,
   schemaTables,
   selectedSchema,
@@ -2027,6 +2114,7 @@ function PreviewWorkspace({
   ducklakeMetaLoading,
   ducklakeSnapshots,
   onActiveTabChange,
+  onConnectionOpen,
   onPreviewTable,
   onSelectCatalog,
   onSelectSchema,
@@ -2131,7 +2219,13 @@ function PreviewWorkspace({
         {isSchemaView ? (
           <SchemaTablesPanel tables={schemaTables} onPreviewTable={onPreviewTable} />
         ) : isCatalogView ? (
-          <CatalogTablesPanel tables={catalogTables} onPreviewTable={onPreviewTable} onSelectSchema={onSelectSchema} />
+          <CatalogTablesPanel
+            isConnected={isConnected}
+            onConnectionOpen={onConnectionOpen}
+            tables={catalogTables}
+            onPreviewTable={onPreviewTable}
+            onSelectSchema={onSelectSchema}
+          />
         ) : (
           <>
             {activeTab === "preview" ? <PreviewPanel preview={preview} /> : null}
@@ -2196,18 +2290,29 @@ function SchemaTablesPanel({
 }
 
 function CatalogTablesPanel({
+  isConnected,
   tables,
+  onConnectionOpen,
   onPreviewTable,
   onSelectSchema,
 }: {
+  isConnected: boolean;
   tables: RemoteTable[];
+  onConnectionOpen: () => void;
   onPreviewTable: (table: RemoteTable) => Promise<void>;
   onSelectSchema: (schema: string) => void;
 }): React.ReactElement {
   const groups = groupTablesBySchema(tables);
 
   if (tables.length === 0) {
-    return <EmptyWorkspacePanel icon={Database} title="No tables" />;
+    return (
+      <EmptyWorkspacePanel
+        action={!isConnected ? <Button onClick={onConnectionOpen}>Connect to catalog</Button> : null}
+        description={!isConnected ? "Connect with a Quack token to browse this catalog." : undefined}
+        icon={Database}
+        title={isConnected ? "No tables" : "Connect to browse"}
+      />
+    );
   }
 
   return (
@@ -2589,17 +2694,30 @@ function DucklakeSnapshotsPanel({
   selectedTable: RemoteTable | null;
   snapshots: SnapshotRow[];
 }): React.ReactElement {
-  const state = getDucklakePanelState(metadata, loading, selectedTable, GitBranch, "No snapshot metadata available");
-  if (state) return state;
+  if (loading) {
+    return (
+      <div className="grid h-full place-items-center">
+        <Loader2 className="size-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (!selectedTable) {
+    return <EmptyWorkspacePanel icon={GitBranch} title="Select a table" />;
+  }
+
+  if (snapshots.length > 0) {
+    return <SnapshotHistoryTable snapshots={snapshots} />;
+  }
+
+  if (!metadata) {
+    return <EmptyWorkspacePanel icon={GitBranch} title="No snapshot metadata available" />;
+  }
 
   const summary = getDucklakeMetadataSummary(metadata);
 
   if (summary.snapshots.length > 0 || summary.snapshotChanges.length > 0 || summary.schemaVersions.length > 0) {
     return <MetadataSnapshotsView summary={summary} />;
-  }
-
-  if (snapshots.length > 0) {
-    return <SnapshotHistoryTable snapshots={snapshots} />;
   }
 
   return <EmptyWorkspacePanel icon={GitBranch} title="No snapshot metadata available" />;
@@ -2800,9 +2918,13 @@ function SnapshotHistoryTable({
 }
 
 function EmptyWorkspacePanel({
+  action,
+  description,
   icon: Icon,
   title,
 }: {
+  action?: React.ReactNode;
+  description?: string;
   icon: typeof Table2;
   title: string;
 }): React.ReactElement {
@@ -2813,6 +2935,8 @@ function EmptyWorkspacePanel({
           <Icon className="size-5" />
         </div>
         <h3 className="text-sm font-semibold text-muted-foreground">{title}</h3>
+        {description ? <p className="max-w-sm text-sm text-muted-foreground">{description}</p> : null}
+        {action ? <div className="pt-1">{action}</div> : null}
       </div>
     </div>
   );
@@ -2937,6 +3061,22 @@ function groupTablesBySchema(tables: RemoteTable[]): Array<[string, RemoteTable[
   }
 
   return Array.from(grouped.entries());
+}
+
+function metadataRequestKind(tab: WorkspaceTab): MetadataRequestKind | null {
+  if (tab === "schema") {
+    return "schema";
+  }
+
+  if (tab === "snapshots") {
+    return "snapshots";
+  }
+
+  if (tab === "files" || tab === "layout" || tab === "raw") {
+    return "full";
+  }
+
+  return null;
 }
 
 function readBootstrapConnection(): BootstrapConnection | null {

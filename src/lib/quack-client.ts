@@ -5,6 +5,7 @@ import duckdbWasmMvp from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
 import duckdbWorkerMvp from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
 
 export type RemoteTable = {
+  table_database?: string;
   table_schema: string;
   table_name: string;
   table_type: string;
@@ -92,53 +93,62 @@ const MANUAL_BUNDLES: duckdb.DuckDBBundles = {
 };
 
 export class QuackClient {
+  private closed = false;
+
   private constructor(
     private readonly conn: duckdb.AsyncDuckDBConnection,
+    private readonly scope: string,
+    private readonly token: string,
   ) {}
 
   static async create(uri: string, token: string): Promise<QuackClient> {
     const db = await warmDuckDB();
     const conn = await db.connect();
     const scope = normalizeScope(uri);
-    const attachUri = attachUriFromScope(scope);
 
-    await loadQuackExtension(conn);
-    await attachRemote(conn, scope, attachUri, token);
+    try {
+      await loadQuackExtension(conn);
+      const client = new QuackClient(conn, scope, token);
+      await client.queryRemote("SELECT 1 AS connection_check");
 
-    return new QuackClient(conn);
+      return client;
+    } catch (error) {
+      await closeConnectionQuietly(conn);
+      throw error;
+    }
   }
 
   async listTables(): Promise<RemoteTable[]> {
     let result: Awaited<ReturnType<duckdb.AsyncDuckDBConnection["query"]>>;
 
     try {
-      result = await this.conn.query(`
-        SELECT *
-        FROM remote.query(${sqlString(`
+      result = await this.queryRemote(`
           SELECT
+            database_name AS table_database,
             schema_name AS table_schema,
             table_name,
             CASE WHEN internal THEN 'INTERNAL' ELSE 'BASE TABLE' END AS table_type
           FROM duckdb_tables()
           ORDER BY schema_name, table_name
-        `)});
-      `);
-    } catch {
-      result = await this.conn.query(`
-        SELECT *
-        FROM remote.query(${sqlString(`
-          SELECT table_schema, table_name, table_type
+        `);
+    } catch (error) {
+      if (!isTableListingCompatibilityError(error)) {
+        throw error;
+      }
+
+      result = await this.queryRemote(`
+          SELECT table_catalog AS table_database, table_schema, table_name, table_type
           FROM information_schema."tables"
           ORDER BY table_schema, table_name
-        `)});
-      `);
+        `);
     }
 
     return rowsFromTable<RemoteTable>(result);
   }
 
-  async previewTable(schema: string, table: string): Promise<PreviewResult> {
+  async previewTable(schema: string, table: string, tableDatabase = ""): Promise<PreviewResult> {
     const result = await this.previewRemoteCandidates([
+      ...(tableDatabase ? [`${quoteIdentifier(tableDatabase)}.${quoteIdentifier(schema)}.${quoteIdentifier(table)}`] : []),
       `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`,
       quoteIdentifier(table),
     ]);
@@ -153,23 +163,29 @@ export class QuackClient {
   }
 
   async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+
+    this.closed = true;
     await this.conn.close();
   }
 
-  async getTableDDL(schema: string, table: string): Promise<TableDDL> {
+  async getTableDDL(schema: string, table: string, tableDatabase = ""): Promise<TableDDL> {
     const [row] = await this.queryRemoteRows<TableDDL>(`
       SELECT sql
       FROM duckdb_tables()
       WHERE schema_name = ${sqlString(schema)}
         AND table_name = ${sqlString(table)}
+        ${tableDatabase ? `AND database_name = ${sqlString(tableDatabase)}` : ""}
         AND NOT internal
     `);
 
     return row ?? { sql: "" };
   }
 
-  async getTableStats(schema: string, table: string): Promise<ColumnStat[]> {
-    const meta = await this.getDucklakeMetaPrefix();
+  async getTableStats(schema: string, table: string, tableDatabase = ""): Promise<ColumnStat[]> {
+    const meta = await this.getDucklakeMetaPrefix(tableDatabase);
     const remoteSql = `
       SELECT
         c.column_name,
@@ -192,13 +208,14 @@ export class QuackClient {
       WHERE t.end_snapshot IS NULL
         AND s.schema_name = ${sqlString(schema)}
         AND t.table_name = ${sqlString(table)}
+        ${tableDatabase ? `AND c.table_catalog = ${sqlString(tableDatabase)}` : ""}
       ORDER BY c.ordinal_position
     `;
 
     return this.queryRemoteRows<ColumnStat>(remoteSql);
   }
 
-  async getColumnDetails(schema: string, table: string): Promise<ColumnDetail[]> {
+  async getColumnDetails(schema: string, table: string, tableDatabase = ""): Promise<ColumnDetail[]> {
     return this.queryRemoteRows<ColumnDetail>(`
       SELECT
         column_name,
@@ -210,11 +227,12 @@ export class QuackClient {
       FROM information_schema."columns"
       WHERE table_schema = ${sqlString(schema)}
         AND table_name = ${sqlString(table)}
+        ${tableDatabase ? `AND table_catalog = ${sqlString(tableDatabase)}` : ""}
       ORDER BY ordinal_position
     `);
   }
 
-  async getTableStorage(schema: string, table: string): Promise<TableStorage> {
+  async getTableStorage(schema: string, table: string, tableDatabase = ""): Promise<TableStorage> {
     const [ddRow] = await this.queryRemoteRows<Pick<TableStorage, "estimated_size" | "column_count" | "has_primary_key">>(`
       SELECT
         COALESCE(estimated_size, 0) AS estimated_size,
@@ -223,10 +241,11 @@ export class QuackClient {
       FROM duckdb_tables()
       WHERE schema_name = ${sqlString(schema)}
         AND table_name = ${sqlString(table)}
+        ${tableDatabase ? `AND database_name = ${sqlString(tableDatabase)}` : ""}
         AND NOT internal
     `);
 
-    const meta = await this.getDucklakeMetaPrefix();
+    const meta = await this.getDucklakeMetaPrefix(tableDatabase);
     const [dlRow] = await this.queryRemoteRows<Pick<TableStorage, "row_count" | "estimated_size">>(`
       SELECT
         COALESCE(st.record_count, 0) AS row_count,
@@ -247,8 +266,8 @@ export class QuackClient {
     };
   }
 
-  async getSnapshotHistory(schema: string, table: string): Promise<SnapshotRow[]> {
-    const meta = await this.getDucklakeMetaPrefix();
+  async getSnapshotHistory(schema: string, table: string, tableDatabase = ""): Promise<SnapshotRow[]> {
+    const meta = await this.getDucklakeMetaPrefix(tableDatabase);
 
     return this.queryRemoteRows<SnapshotRow>(`
       SELECT DISTINCT s.snapshot_id, s.snapshot_time, sc.author, sc.commit_message
@@ -261,11 +280,12 @@ export class QuackClient {
         AND t.table_name = ${sqlString(table)}
         AND s.snapshot_id >= COALESCE(t.begin_snapshot, 0)
       ORDER BY s.snapshot_id DESC
+      LIMIT ${PREVIEW_LIMIT}
     `);
   }
 
-  async getDucklakeMetadata(schema: string, table: string): Promise<DucklakeMetadata> {
-    const meta = await this.getDucklakeMetaPrefix();
+  async getDucklakeMetadata(schema: string, table: string, tableDatabase = ""): Promise<DucklakeMetadata> {
+    const meta = await this.getDucklakeMetaPrefix(tableDatabase);
     const [tableRow] = await this.queryRemoteRows<{ table_id: number; begin_snapshot: number | null }>(`
       SELECT t.table_id, t.begin_snapshot
       FROM ${meta}.ducklake_table t
@@ -328,26 +348,46 @@ export class QuackClient {
     };
   }
 
-  private ducklakeMetaDb: string | null = null;
-  private ducklakeMetaSchema: string | null = null;
+  private readonly ducklakeMetaDbByTableDatabase = new Map<string, string>();
+  private readonly ducklakeMetaSchemaByMetaDb = new Map<string, string>();
 
-  private async getDucklakeMetaDb(): Promise<string> {
-    if (this.ducklakeMetaDb) return this.ducklakeMetaDb;
+  private async getDucklakeMetaDb(tableDatabase = ""): Promise<string> {
+    const cacheKey = tableDatabase.trim();
+    const cached = this.ducklakeMetaDbByTableDatabase.get(cacheKey);
+
+    if (cached) {
+      return cached;
+    }
 
     const rows = await this.queryRemoteRows<{ database_name: string }>(`
       SELECT DISTINCT database_name
       FROM duckdb_tables()
-      WHERE database_name LIKE '__ducklake_metadata_%'
+      WHERE starts_with(database_name, '__ducklake_metadata_')
+      ORDER BY
+        CASE
+          WHEN ${cacheKey ? `database_name = ${sqlString(`__ducklake_metadata_${cacheKey}`)}` : "false"} THEN 0
+          ELSE 1
+        END,
+        database_name
     `);
 
-    this.ducklakeMetaDb = rows[0]?.database_name ?? "__ducklake_metadata_unknown";
-    return this.ducklakeMetaDb;
+    const metaDb = rows[0]?.database_name;
+
+    if (!metaDb) {
+      throw new Error("Could not find the DuckLake metadata database for this catalog.");
+    }
+
+    this.ducklakeMetaDbByTableDatabase.set(cacheKey, metaDb);
+    return metaDb;
   }
 
-  private async getDucklakeMetaSchema(): Promise<string> {
-    if (this.ducklakeMetaSchema) return this.ducklakeMetaSchema;
+  private async getDucklakeMetaSchema(metaDb: string): Promise<string> {
+    const cached = this.ducklakeMetaSchemaByMetaDb.get(metaDb);
 
-    const metaDb = await this.getDucklakeMetaDb();
+    if (cached) {
+      return cached;
+    }
+
     const rows = await this.queryRemoteRows<{ schema_name: string }>(`
       SELECT DISTINCT schema_name
       FROM duckdb_tables()
@@ -356,24 +396,33 @@ export class QuackClient {
       ORDER BY CASE WHEN schema_name = 'public' THEN 0 ELSE 1 END, schema_name
     `);
 
-    this.ducklakeMetaSchema = rows[0]?.schema_name ?? "public";
-    return this.ducklakeMetaSchema;
+    const metaSchema = rows[0]?.schema_name ?? "main";
+    this.ducklakeMetaSchemaByMetaDb.set(metaDb, metaSchema);
+    return metaSchema;
   }
 
-  private async getDucklakeMetaPrefix(): Promise<string> {
-    const metaDb = await this.getDucklakeMetaDb();
-    const metaSchema = await this.getDucklakeMetaSchema();
+  private async getDucklakeMetaPrefix(tableDatabase = ""): Promise<string> {
+    const metaDb = await this.getDucklakeMetaDb(tableDatabase);
+    const metaSchema = await this.getDucklakeMetaSchema(metaDb);
 
     return `${quoteIdentifier(metaDb)}.${quoteIdentifier(metaSchema)}`;
   }
 
   private async queryRemoteRows<T extends Record<string, unknown>>(remoteSql: string): Promise<T[]> {
-    const result = await this.conn.query(`
-      SELECT *
-      FROM remote.query(${sqlString(remoteSql)});
-    `);
+    const result = await this.queryRemote(remoteSql);
 
     return rowsFromTable<T>(result);
+  }
+
+  private queryRemote(remoteSql: string): Promise<Awaited<ReturnType<duckdb.AsyncDuckDBConnection["query"]>>> {
+    return this.conn.query(`
+      SELECT *
+      FROM quack_query(
+        ${sqlString(this.scope)},
+        ${sqlString(remoteSql)},
+        token => ${sqlString(this.token)}
+      );
+    `);
   }
 
   private async previewRemoteCandidates(
@@ -412,10 +461,7 @@ export class QuackClient {
       LIMIT ${PREVIEW_LIMIT}
     `;
 
-    return this.conn.query(`
-      SELECT *
-      FROM remote.query(${sqlString(remoteSql)});
-    `);
+    return this.queryRemote(remoteSql);
   }
 }
 
@@ -432,7 +478,12 @@ function metadataSpec(id: string, label: string, source: string, where: string, 
 let duckDBPromise: Promise<duckdb.AsyncDuckDB> | null = null;
 
 export async function warmDuckDB(): Promise<duckdb.AsyncDuckDB> {
-  duckDBPromise ??= instantiateDuckDB();
+  if (!duckDBPromise) {
+    duckDBPromise = instantiateDuckDB().catch((error: unknown) => {
+      duckDBPromise = null;
+      throw error;
+    });
+  }
 
   return duckDBPromise;
 }
@@ -445,25 +496,28 @@ async function instantiateDuckDB(): Promise<duckdb.AsyncDuckDB> {
 
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
 
+  let conn: duckdb.AsyncDuckDBConnection | null = null;
+
   try {
-    const conn = await db.connect();
+    conn = await db.connect();
     await loadQuackExtension(conn);
-    await conn.close();
   } catch {
     // A connection attempt will surface extension-loading failures with endpoint context.
+  } finally {
+    await closeConnectionQuietly(conn);
   }
 
   return db;
 }
 
 export function tableKey(table: RemoteTable): string {
-  return `${table.table_schema}.${table.table_name}`;
+  return `${table.table_database ? `${table.table_database}.` : ""}${table.table_schema}.${table.table_name}`;
 }
 
 export function formatError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
 
-  if (/cors|failed to fetch|networkerror|load failed/i.test(message)) {
+  if (/cors|failed to fetch|networkerror|load failed|failed to send message|access-control/i.test(message)) {
     return `${message} Check that the Quack endpoint allows this browser origin with CORS.`;
   }
 
@@ -501,11 +555,9 @@ export function stringifyCell(value: unknown): string {
 }
 
 function normalizeScope(uri: string): string {
-  return uri.replace(/^quack:quack:/, "quack:");
-}
+  const trimmed = uri.trim();
 
-function attachUriFromScope(scope: string): string {
-  return scope.startsWith("quack:quack:") ? scope : `quack:${scope}`;
+  return trimmed.replace(/^(?:quack:)+/i, "quack:");
 }
 
 function quoteIdentifier(identifier: string): string {
@@ -563,31 +615,20 @@ async function loadQuackExtension(conn: duckdb.AsyncDuckDBConnection): Promise<v
   await conn.query("LOAD quack;");
 }
 
-async function attachRemote(
-  conn: duckdb.AsyncDuckDBConnection,
-  scope: string,
-  attachUri: string,
-  token: string,
-): Promise<void> {
+function isTableListingCompatibilityError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+
+  return /duckdb_tables|information_schema|binder error|catalog error|column .* not found|does not exist/i.test(message);
+}
+
+async function closeConnectionQuietly(conn: duckdb.AsyncDuckDBConnection | null): Promise<void> {
+  if (!conn) {
+    return;
+  }
+
   try {
-    await conn.query(`
-      CREATE OR REPLACE SECRET quack_credentials (
-        TYPE quack,
-        SCOPE ${sqlString(scope)},
-        TOKEN ${sqlString(token)}
-      );
-    `);
-    await conn.query(`ATTACH ${sqlString(attachUri)} AS remote (TYPE quack);`);
-  } catch (secretError) {
-    try {
-      await conn.query(`
-        ATTACH ${sqlString(scope)} AS remote (
-          TYPE quack,
-          TOKEN ${sqlString(token)}
-        );
-      `);
-    } catch (attachError) {
-      throw new Error(`${formatError(secretError)} Fallback attach failed: ${formatError(attachError)}`);
-    }
+    await conn.close();
+  } catch {
+    // Preserve the original connection or query error.
   }
 }
