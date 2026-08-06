@@ -12,7 +12,7 @@ const appHost = options.host || env.QUACKALOG_APP_HOST || "127.0.0.1";
 const appPort = options.port || env.QUACKALOG_APP_PORT || "5173";
 const appUrl = `http://${appHost}:${appPort}/`;
 const quackCommand = options.quackCommand || env.QUACKALOG_QUACK_COMMAND || "";
-const seedQuackUri = options.seedQuackUri || env.QUACKALOG_SEED_QUACK_URI || "quack:127.0.0.1:9494";
+const seedQuackUri = options.seedQuackUri || env.QUACKALOG_SEED_QUACK_URI || "";
 const seedToken = options.seedToken || env.QUACKALOG_SEED_TOKEN || env.VITE_QUACK_TOKEN || env.token || "quackalog-dev-token";
 const catalogs = collectCatalogs(options, env, seedQuackUri);
 
@@ -48,7 +48,7 @@ if (quackCommand) {
 
 children.push(spawnProcess("npm", ["run", "dev", "--", "--host", appHost, "--port", appPort], "vite", {
   ...process.env,
-  VITE_QUACK_TOKEN: env.VITE_QUACK_TOKEN || env.token || seedToken,
+  VITE_QUACK_TOKEN: env.VITE_QUACK_TOKEN || env.token || "",
 }));
 
 const stop = () => {

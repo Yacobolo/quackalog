@@ -48,10 +48,12 @@ export function DialogContent({
   title,
   onOpenChange,
 }: DialogContentProps): React.ReactElement {
+  const closeLabel = `Close ${title.toLowerCase()} dialog`;
+
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-overlay-backdrop p-4 backdrop-blur-sm">
       <button
-        aria-label="Close connection dialog"
+        aria-label={closeLabel}
         className="absolute inset-0 cursor-default"
         type="button"
         onClick={() => onOpenChange(false)}
@@ -66,7 +68,7 @@ export function DialogContent({
         role="dialog"
       >
         <Button
-          aria-label="Close connection dialog"
+          aria-label={closeLabel}
           className="absolute right-3 top-3"
           size="icon"
           type="button"
