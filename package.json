@@ -9,6 +9,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "seed:ducklake": "node scripts/seed-ducklake.mjs",
+    "test": "node --test scripts/*.test.mjs",
     "write:runtime-config": "node scripts/write-runtime-config.mjs"
   },
   "dependencies": {

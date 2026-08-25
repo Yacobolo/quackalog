@@ -36,4 +36,4 @@ http://127.0.0.1:5173/?catalog_uri=quack:your-remote-dev-host.example.com:443&ca
 
 ## GitHub Pages deployment
 
-Set a repository variable named `QUACK_URL` (or `VITE_QUACK_URI`) to the public Quack endpoint before deploying. The Pages workflow writes a remote-only runtime catalog config during the build. Tokens are never baked into the static bundle; users paste a token or unlock one from the local encrypted vault. The Quack endpoint must allow the deployed origin, such as `https://yacobolo.github.io`, with CORS on `POST /quack`.
+Set a repository variable named `QUACK_URL` (or `VITE_QUACK_URI`) to preconfigure a public Quack endpoint. When neither variable is set, the Pages workflow still deploys with an empty runtime catalog config and users can add a connection in the app. Tokens are never baked into the static bundle; users paste a token or unlock one from the local encrypted vault. The Quack endpoint must allow the deployed origin, such as `https://yacobolo.github.io`, with CORS on `POST /quack`.
